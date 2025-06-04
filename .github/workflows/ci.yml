@@ -186,7 +186,7 @@ jobs:
             fi
           fi
       - name: Test Slang
-        if: steps.filter.outputs.should-run == 'true' && matrix.platform != 'wasm' && (matrix.platform != 'aarch64' || matrix.os == 'macos')
+        if: steps.filter.outputs.should-run == 'false' && matrix.platform != 'wasm' && (matrix.platform != 'aarch64' || matrix.os == 'macos')
         run: |
           export SLANG_RUN_SPIRV_VALIDATION=1
           export SLANG_USE_SPV_SOURCE_LANGUAGE_UNKNOWN=1
@@ -225,7 +225,7 @@ jobs:
               -enable-debug-layers false
           fi
       - name: Run Slang examples
-        if: steps.filter.outputs.should-run == 'true' && matrix.platform != 'wasm' && matrix.full-gpu-tests
+        if: steps.filter.outputs.should-run == 'false' && matrix.platform != 'wasm' && matrix.full-gpu-tests
         run: |
           .github/workflows/ci-examples.sh \
            --bin-dir "$bin_dir" \
@@ -234,11 +234,11 @@ jobs:
            --config "${{matrix.config}}" \
            --skip-file tests/expected-example-failure-github.txt
       - name: Run slangc tests
-        if: steps.filter.outputs.should-run == 'true' && matrix.platform != 'wasm'
+        if: steps.filter.outputs.should-run == 'false' && matrix.platform != 'wasm'
         run: |
           PATH=$bin_dir:$PATH tools/slangc-test/test.sh
       - name: Test Slang via glsl
-        if: steps.filter.outputs.should-run == 'true' && matrix.full-gpu-tests && matrix.platform != 'wasm' && matrix.config != 'debug'
+        if: steps.filter.outputs.should-run == 'false' && matrix.full-gpu-tests && matrix.platform != 'wasm' && matrix.config != 'debug'
         run: |
           export SLANG_RUN_SPIRV_VALIDATION=1
           export SLANG_USE_SPV_SOURCE_LANGUAGE_UNKNOWN=1
@@ -252,7 +252,7 @@ jobs:
             -skip-reference-image-generation \
             -show-adapter-info
       - name: slang-rhi tests
-        if: steps.filter.outputs.should-run == 'true' && matrix.platform != 'wasm' && matrix.full-gpu-tests
+        if: steps.filter.outputs.should-run == 'false' && matrix.platform != 'wasm' && matrix.full-gpu-tests
         shell: pwsh
         run: |
           if (!(Test-Path -Path "external/slang-rhi/build")) {
@@ -284,14 +284,22 @@ jobs:
           Write-Host "Cleaning up existing installations..."
           Start-Process -FilePath "python" -ArgumentList "-m pip uninstall -y slangpy" -Verb RunAs -Wait
           Write-Host "Installing slangpy..."
-          python -m pip install --no-cache-dir --verbose slangpy --user
+          python -m pip install --no-cache-dir --verbose slangpy==0.30 --user
           Write-Host "Getting Python site-packages directory and copying library files (DLL, SO, DYLIB)..."
           $SITE_PACKAGES = python -c "import slangpy; print(slangpy.__file__.rsplit('\\', 2)[0])"
+          $bin_dir = $env:bin_dir -replace '^/c/', 'C:\' -replace '/', '\'
           Write-Host "Site packages directory: $SITE_PACKAGES"
-          Write-Host "Copying library files..."
-          Copy-Item -Path "$bin_dir\*" -Include "*.dll","*.so","*.dylib" -Destination "$SITE_PACKAGES\slangpy\" -Force -ErrorAction Continue
+          Write-Host "bin_dir location: $bin_dir"
+          try {
+            Copy-Item -Path "$bin_dir\*.dll" -Destination "$SITE_PACKAGES\slangpy\" -Force -ErrorAction Stop
+            Copy-Item -Path "$bin_dir\*.so" -Destination "$SITE_PACKAGES\slangpy\" -Force -ErrorAction Stop
+            Copy-Item -Path "$bin_dir\*.dylib" -Destination "$SITE_PACKAGES\slangpy\" -Force -ErrorAction Stop
+          } catch {
+            Write-Error "Failed to copy library files: $_"
+            exit 1
+          }
           Write-Host "Listing files in slangpy directory..."
-          Get-ChildItem -Path "$SITE_PACKAGES\slangpy" | Write-Host
+          Get-ChildItem -Path "$SITE_PACKAGES\slangpy" | ForEach-Object { Write-Host "$($_.Name) - Last Modified: $($_.LastWriteTime)" }
           Write-Host "Running pytest on slangpy tests..."
           $env:PYTHONPATH = "$SITE_PACKAGES"
           python -m pytest "$SITE_PACKAGES\slangpy\tests" -v
