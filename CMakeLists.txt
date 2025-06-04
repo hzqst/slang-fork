@@ -16,6 +16,12 @@ get_git_version(
 project(slang VERSION "${SLANG_VERSION_NUMERIC}" LANGUAGES)
 set(PROJECT_VERSION "${SLANG_VERSION_FULL}")
 
+option(USE_VCLTL "USE VCLTL" OFF)
+
+if(USE_VCLTL)
+include("VC-LTL helper for cmake.cmake")
+endif()
+
 #
 # Global CMake options
 #
