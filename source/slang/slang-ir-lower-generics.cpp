@@ -23,11 +23,11 @@
 namespace Slang
 {
 // Replace all uses of RTTI objects with its sequential ID.
-// Currently we don't use RTTI objects at all, so all of them
-// are 0.
+// Currently we don't use RTTI objects other than check for null/invalid value,
+// so all of them are 0xFFFFFFFF.
 void specializeRTTIObjectReferences(SharedGenericsLoweringContext* sharedContext)
 {
-    uint32_t id = 0;
+    uint32_t id = 0xFFFFFFFF;
     for (auto rtti : sharedContext->mapTypeToRTTIObject)
     {
         IRBuilder builder(sharedContext->module);
@@ -43,7 +43,7 @@ void specializeRTTIObjectReferences(SharedGenericsLoweringContext* sharedContext
         for (auto use = rtti.value->firstUse; use; use = nextUse)
         {
             nextUse = use->nextUse;
-            if (use->getUser()->getOp() == kIROp_GetAddr)
+            if (use->getUser()->getOp() == kIROp_GetAddress)
             {
                 use->getUser()->replaceUsesWith(idOperand);
             }

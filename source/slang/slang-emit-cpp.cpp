@@ -305,8 +305,27 @@ SlangResult CPPSourceEmitter::calcTypeName(IRType* type, CodeGenTarget target, S
         }
     case kIROp_NativePtrType:
     case kIROp_PtrType:
-    case kIROp_ConstRefType:
+    case kIROp_BorrowInParamType:
         {
+            // Special note on `constref` types and why they are not emitted
+            // as a `const` pointer:
+            //
+            // We currently do not propegate/manage "constness" for locals.
+            // This is important since it means that we rely on opimization
+            // passes to remove all temporary pointer-variables created from
+            // our constref, otherwise we will generate invalid code like
+            // `T* var = const_ptr` or `T* var = &const_ptr->member`.
+            //
+            // If emitting `constref` fails due to this error, it is likely
+            // a missing compiler-optimization.
+            //
+            // Additionally, for C++/CUDA, downstream methods are required
+            // to be `const` if we want to use const pointers. This is currently
+            // not handled robustly.
+            //
+            // Due to these cascading issues, we do not emit const and instead
+            // emit as a regular pointer for the time being.
+
             auto elementType = (IRType*)type->getOperand(0);
             SLANG_RETURN_ON_FAIL(calcTypeName(elementType, target, out));
             out << "*";
@@ -480,8 +499,8 @@ void CPPSourceEmitter::useType(IRType* type)
             type = static_cast<IRPtrType*>(type)->getValueType();
             break;
         }
-    case kIROp_RefType:
-    case kIROp_ConstRefType:
+    case kIROp_RefParamType:
+    case kIROp_BorrowInParamType:
         {
             type = static_cast<IRPtrTypeBase*>(type)->getValueType();
             break;
@@ -599,6 +618,7 @@ CPPSourceEmitter::CPPSourceEmitter(const Desc& desc)
 
 void CPPSourceEmitter::emitParamTypeImpl(IRType* type, String const& name)
 {
+    // For use the CPP-specific emitType implementation
     emitType(type, name);
 }
 
@@ -1131,16 +1151,16 @@ void CPPSourceEmitter::_emitType(IRType* type, DeclaratorInfo* declarator)
             break;
         }
     case kIROp_PtrType:
-    case kIROp_InOutType:
-    case kIROp_OutType:
+    case kIROp_BorrowInOutParamType:
+    case kIROp_OutParamType:
         {
             auto ptrType = cast<IRPtrTypeBase>(type);
             PtrDeclaratorInfo ptrDeclarator(declarator);
             _emitType(ptrType->getValueType(), &ptrDeclarator);
         }
         break;
-    case kIROp_RefType:
-    case kIROp_ConstRefType:
+    case kIROp_RefParamType:
+    case kIROp_BorrowInParamType:
         {
             auto ptrType = cast<IRPtrTypeBase>(type);
             PtrDeclaratorInfo refDeclarator(declarator);
@@ -1152,8 +1172,16 @@ void CPPSourceEmitter::_emitType(IRType* type, DeclaratorInfo* declarator)
             auto arrayType = static_cast<IRArrayType*>(type);
             auto elementType = arrayType->getElementType();
             int elementCount = int(getIntVal(arrayType->getElementCount()));
-
-            m_writer->emit("FixedArray<");
+            auto nameHint = arrayType->findDecoration<IRNameHintDecoration>();
+            bool isCoopVec = nameHint && (nameHint->getName() == UnownedStringSlice("CoopVec"));
+            if (isCoopVec && isOptixCoopVec)
+            {
+                m_writer->emit("OptixCoopVec<");
+            }
+            else
+            {
+                m_writer->emit("FixedArray<");
+            }
             _emitType(elementType, nullptr);
             m_writer->emit(", ");
             m_writer->emit(elementCount);
@@ -1553,7 +1581,7 @@ bool CPPSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inOut
             m_writer->emit("])");
             return true;
         }
-    case kIROp_swizzle:
+    case kIROp_Swizzle:
         {
             // For C++ we don't need to emit a swizzle function
             // For C we need a construction function
@@ -1669,7 +1697,7 @@ bool CPPSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inOut
             // try doing automatically
             return false;
         }
-    case kIROp_LookupWitness:
+    case kIROp_LookupWitnessMethod:
         {
             emitInstExpr(inst->getOperand(0), inOuterPrec);
             m_writer->emit("->");
@@ -1689,7 +1717,7 @@ bool CPPSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inOut
             m_writer->emit(")");
             return true;
         }
-    case kIROp_GetAddr:
+    case kIROp_GetAddress:
         {
             // Once we clean up the pointer emitting logic, we can
             // just use GetElementAddress instruction in place of

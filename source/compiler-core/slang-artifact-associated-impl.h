@@ -166,6 +166,7 @@ struct ShaderBindingRange
         case slang::VaryingInput:
         case slang::VaryingOutput:
         case slang::SpecializationConstant:
+        case slang::SubElementRegisterSpace:
             return true;
         default:
             return false;
@@ -198,6 +199,8 @@ public:
         SlangUInt registerIndex,         // `register` for D3D12, `binding` for Vulkan
         bool& outUsed) SLANG_OVERRIDE;
 
+    SLANG_NO_THROW virtual const char* SLANG_MCALL getDebugBuildIdentifier() SLANG_OVERRIDE;
+
     void* getInterface(const Guid& uuid);
     void* getObject(const Guid& uuid);
 
@@ -208,6 +211,7 @@ public:
 
     List<ShaderBindingRange> m_usedBindings;
     List<String> m_exportedFunctionMangledNames;
+    String m_debugBuildIdentifier;
 };
 
 } // namespace Slang

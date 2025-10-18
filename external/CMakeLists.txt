@@ -82,16 +82,18 @@ if(NOT ${SLANG_USE_SYSTEM_LZ4})
 endif()
 
 # Vulkan headers
-if(NOT ${SLANG_USE_SYSTEM_VULKAN_HEADERS})
-    if(NOT SLANG_OVERRIDE_VULKAN_HEADERS_PATH)
-        add_subdirectory(vulkan EXCLUDE_FROM_ALL ${system})
-    else()
-        add_subdirectory(
-            ${SLANG_OVERRIDE_VULKAN_HEADERS_PATH}/vulkan
-            vulkan
-            EXCLUDE_FROM_ALL
-            ${system}
-        )
+if(NOT TARGET Vulkan::Headers)
+    if(NOT ${SLANG_USE_SYSTEM_VULKAN_HEADERS})
+        if(NOT SLANG_OVERRIDE_VULKAN_HEADERS_PATH)
+            add_subdirectory(vulkan EXCLUDE_FROM_ALL ${system})
+        else()
+            add_subdirectory(
+                ${SLANG_OVERRIDE_VULKAN_HEADERS_PATH}/vulkan
+                vulkan
+                EXCLUDE_FROM_ALL
+                ${system}
+            )
+        endif()
     endif()
 endif()
 
@@ -103,55 +105,137 @@ target_include_directories(
 )
 
 # SPIRV-Headers
-if(NOT ${SLANG_USE_SYSTEM_SPIRV_HEADERS})
-    if(NOT SLANG_OVERRIDE_SPIRV_HEADERS_PATH)
-        add_subdirectory(spirv-headers EXCLUDE_FROM_ALL ${system})
-    else()
+# Avoid using ${system} intentionally in `add_subdirectory`, because if we do, it will end up using
+# spirv.h installed in the system directory on MacOS.
+if(NOT TARGET SPIRV-Headers)
+    if(SLANG_USE_SYSTEM_SPIRV_HEADERS)
+        if(SLANG_OVERRIDE_SPIRV_HEADERS_PATH)
+            message(
+                WARNING
+                "SLANG_OVERRIDE_SPIRV_HEADERS_PATH does nothing when SLANG_USE_SPIRV_HEADERS is set"
+            )
+        endif()
+    elseif(SLANG_OVERRIDE_SPIRV_HEADERS_PATH)
         add_subdirectory(
             ${SLANG_OVERRIDE_SPIRV_HEADERS_PATH}/spirv-headers
             spirv-headers
             EXCLUDE_FROM_ALL
-            ${system}
         )
+    else()
+        add_subdirectory(spirv-headers EXCLUDE_FROM_ALL)
     endif()
 endif()
 
 if(SLANG_ENABLE_SLANG_GLSLANG)
-    # SPIRV-Tools
-    set(SPIRV_TOOLS_BUILD_STATIC ON)
-    set(SPIRV_WERROR OFF)
-    # Headers
-    if(NOT SLANG_OVERRIDE_SPIRV_HEADERS_PATH)
-        set(SPIRV_HEADER_DIR "${CMAKE_CURRENT_LIST_DIR}/spirv-headers/")
-    else()
-        set(SPIRV_HEADER_DIR ${SLANG_OVERRIDE_SPIRV_HEADERS_PATH}/spirv-headers)
-    endif()
-    set(SPIRV_SKIP_TESTS ON)
-    # Tools
-    if(NOT SLANG_OVERRIDE_SPIRV_TOOLS_PATH)
-        add_subdirectory(spirv-tools EXCLUDE_FROM_ALL ${system})
-    else()
-        add_subdirectory(
-            ${SLANG_OVERRIDE_SPIRV_TOOLS_PATH}/spirv-tools
-            spirv-tools
-            EXCLUDE_FROM_ALL
-            ${system}
+    # When using spirv headers via find_package, SPIRV-Headers_SOURCE_DIR is not set
+    # SPIRV-Tools requires that variable, as it uses it to detect if SPIRV-Headers is provided by the consumer.
+    # Fake a source build by setting it here. Ideally SPIRV-Tools should not depend on _SOURCE_DIR
+    if(${SLANG_USE_SYSTEM_SPIRV_HEADERS})
+        get_target_property(
+            SPIRV-Headers_SOURCE_DIR
+            SPIRV-Headers::SPIRV-Headers
+            INTERFACE_INCLUDE_DIRECTORIES
+        )
+        cmake_path(
+            GET
+            SPIRV-Headers_SOURCE_DIR
+            PARENT_PATH SPIRV-Headers_SOURCE_DIR
         )
     endif()
 
-    # glslang
-    set(SKIP_GLSLANG_INSTALL ON)
-    set(ENABLE_OPT ON)
-    set(ENABLE_PCH OFF)
-    if(NOT SLANG_OVERRIDE_GLSLANG_PATH)
-        add_subdirectory(glslang EXCLUDE_FROM_ALL ${system})
-    else()
-        add_subdirectory(
-            ${SLANG_OVERRIDE_GLSLANG_PATH}/glslang
-            glslang
-            EXCLUDE_FROM_ALL
-            ${system}
-        )
+    if(NOT ${SLANG_USE_SYSTEM_SPIRV_TOOLS})
+        # SPIRV-Tools
+        set(SPIRV_TOOLS_BUILD_STATIC ON)
+        set(SPIRV_WERROR OFF)
+        set(SPIRV_SKIP_TESTS ON)
+
+        # Enable mimalloc for SPIRV-Tools to improve compilation performance
+        # Based on SPIRV-Tools PR #6267: https://github.com/KhronosGroup/SPIRV-Tools/pull/6267
+        if(SLANG_ENABLE_SPIRV_TOOLS_MIMALLOC)
+            if(NOT SLANG_OVERRIDE_MIMALLOC_PATH)
+                # Place mimalloc in slang/external instead of spirv-tools/external for better organization
+                set(MIMALLOC_PATH "${CMAKE_CURRENT_SOURCE_DIR}/mimalloc")
+            else()
+                set(MIMALLOC_PATH "${SLANG_OVERRIDE_MIMALLOC_PATH}/mimalloc")
+            endif()
+
+            # Download mimalloc if it's not available
+            if(NOT EXISTS "${MIMALLOC_PATH}/CMakeLists.txt")
+                message(
+                    STATUS
+                    "mimalloc not found at ${MIMALLOC_PATH} - downloading..."
+                )
+                execute_process(
+                    COMMAND
+                        ${GIT_EXECUTABLE} clone --depth 1 --branch v2.1.7
+                        https://github.com/microsoft/mimalloc.git
+                        "${MIMALLOC_PATH}"
+                    RESULT_VARIABLE git_result
+                    OUTPUT_QUIET
+                    ERROR_QUIET
+                )
+                if(git_result EQUAL 0)
+                    # Point SPIRV-Tools to our mimalloc location
+                    set(mimalloc_SOURCE_DIR "${MIMALLOC_PATH}")
+                    set(SPIRV_TOOLS_USE_MIMALLOC ON)
+                    set(SPIRV_TOOLS_USE_MIMALLOC_IN_STATIC_BUILD ON)
+                    # set(MI_INSTALL_TOPLEVEL OFF)
+                    message(
+                        STATUS
+                        "Successfully downloaded and enabled mimalloc for SPIRV-Tools at ${MIMALLOC_PATH}"
+                    )
+                else()
+                    message(
+                        WARNING
+                        "Failed to download mimalloc. Building SPIRV-Tools without mimalloc support."
+                    )
+                endif()
+            endif()
+
+            # Check if mimalloc is available now
+            if(EXISTS "${MIMALLOC_PATH}/CMakeLists.txt")
+                # Point SPIRV-Tools to our mimalloc location
+                set(mimalloc_SOURCE_DIR "${MIMALLOC_PATH}")
+                set(SPIRV_TOOLS_USE_MIMALLOC ON)
+                # Also enable mimalloc in static builds for better performance
+                set(SPIRV_TOOLS_USE_MIMALLOC_IN_STATIC_BUILD ON)
+                # Disable mimalloc installation to avoid install target conflicts
+                # set(MI_INSTALL_TOPLEVEL OFF)
+                message(
+                    STATUS
+                    "Enabling mimalloc for SPIRV-Tools (including static builds) from ${MIMALLOC_PATH}"
+                )
+            endif()
+        endif()
+
+        # Tools
+        if(NOT SLANG_OVERRIDE_SPIRV_TOOLS_PATH)
+            add_subdirectory(spirv-tools EXCLUDE_FROM_ALL)
+        else()
+            add_subdirectory(
+                ${SLANG_OVERRIDE_SPIRV_TOOLS_PATH}/spirv-tools
+                spirv-tools
+                EXCLUDE_FROM_ALL
+            )
+        endif()
+    endif()
+
+    if(NOT ${SLANG_USE_SYSTEM_GLSLANG})
+        # glslang
+        set(SKIP_GLSLANG_INSTALL ON)
+        set(ENABLE_OPT ON)
+        set(ENABLE_PCH OFF)
+        set(ALLOW_EXTERNAL_SPIRV_TOOLS ${SLANG_USE_SYSTEM_SPIRV_TOOLS})
+        if(NOT SLANG_OVERRIDE_GLSLANG_PATH)
+            add_subdirectory(glslang EXCLUDE_FROM_ALL ${system})
+        else()
+            add_subdirectory(
+                ${SLANG_OVERRIDE_GLSLANG_PATH}/glslang
+                glslang
+                EXCLUDE_FROM_ALL
+                ${system}
+            )
+        endif()
     endif()
 endif()
 
@@ -182,13 +266,24 @@ target_include_directories(
 # slang-rhi
 if(SLANG_ENABLE_SLANG_RHI)
     set(SLANG_RHI_BUILD_FROM_SLANG_REPO ON)
+    set(SLANG_RHI_BUILD_TESTS ON)
+    set(SLANG_RHI_BUILD_TESTS_WITH_GLFW OFF)
     set(SLANG_RHI_INSTALL OFF)
     set(SLANG_RHI_BINARY_DIR ${CMAKE_BINARY_DIR}/$<CONFIG>/bin)
     set(SLANG_RHI_FETCH_SLANG OFF)
     set(SLANG_RHI_SLANG_INCLUDE_DIR ${slang_SOURCE_DIR}/include)
     set(SLANG_RHI_SLANG_BINARY_DIR ${CMAKE_BINARY_DIR})
-
     set(SLANG_RHI_ENABLE_NVAPI ${SLANG_ENABLE_NVAPI})
+
+    # CoopVec requires 1.717.0-preview, but we cannot use the version until slang-rhi
+    # allow slang to override D3D12Version value
+    #set(SLANG_RHI_AGILITY_SDK_VERSION D3D12_PREVIEW_SDK_VERSION)
+    #set(SLANG_RHI_FETCH_AGILITY_SDK_VERSION
+    #    "1.717.0-preview"
+    #    CACHE STRING
+    #    "Agility SDK version to fetch"
+    #    FORCE
+    #)
 
     if(SLANG_ENABLE_DX_ON_VK)
         set(SLANG_RHI_HAS_D3D12 ON)
@@ -210,6 +305,12 @@ if(SLANG_ENABLE_SLANG_RHI)
             ${system}
         )
     endif()
+
+    # Output slang-rhi-tests to the bin directory so we can run it easily.
+    set_target_properties(
+        slang-rhi-tests
+        PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/$<CONFIG>/bin
+    )
 endif()
 
 # Tidy things up:

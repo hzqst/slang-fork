@@ -131,9 +131,12 @@ DeclRefBase* LookupDeclRef::_substituteImplOverride(
 
 void LookupDeclRef::_toTextOverride(StringBuilder& out)
 {
-    getLookupSource()->toText(out);
-    if (out.getLength() && !out.endsWith("."))
-        out << ".";
+    if (!as<ThisType>(getLookupSource()))
+    {
+        getLookupSource()->toText(out);
+        if (out.getLength() && !out.endsWith("."))
+            out << ".";
+    }
     if (getDecl()->getName() && getDecl()->getName()->text.getLength() != 0)
     {
         out << getDecl()->getName()->text;
@@ -255,7 +258,7 @@ void GenericAppDeclRef::_toTextOverride(StringBuilder& out)
 {
     auto genericDecl = as<GenericDecl>(getGenericDeclRef()->getDecl());
     Index paramCount = 0;
-    for (auto member : genericDecl->members)
+    for (auto member : genericDecl->getDirectMemberDecls())
         if (as<GenericTypeParamDeclBase>(member) || as<GenericValueParamDecl>(member))
             paramCount++;
     getGenericDeclRef()->toText(out);
@@ -381,7 +384,7 @@ void DeclRefBase::toText(StringBuilder& out)
                 if (auto genericAppDeclRef = substSet.findGenericAppDeclRef(genericDecl))
                 {
                     Index paramCount = 0;
-                    for (auto member : genericDecl->members)
+                    for (auto member : genericDecl->getDirectMemberDecls())
                         if (as<GenericTypeParamDeclBase>(member) ||
                             as<GenericValueParamDecl>(member))
                             paramCount++;
@@ -421,6 +424,14 @@ SourceLoc DeclRefBase::getNameLoc() const
 SourceLoc DeclRefBase::getLoc() const
 {
     return getDecl()->loc;
+}
+
+// Keep this function here for better debuggin purpose
+String DeclRefBase::toString() const
+{
+    StringBuilder sb;
+    const_cast<DeclRefBase*>(this)->toText(sb);
+    return sb.produceString();
 }
 
 DeclRefBase* DeclRefBase::getParent()

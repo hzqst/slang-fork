@@ -143,7 +143,7 @@ Val* Val::_substituteImplOverride(ASTBuilder* astBuilder, SubstitutionSet subst,
 void Val::_toTextOverride(StringBuilder& out)
 {
     SLANG_UNUSED(out);
-    SLANG_UNEXPECTED("Val::_toStringOverride not overridden");
+    SLANG_UNEXPECTED("Val::_toTextOverride not overridden");
 }
 
 // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! ConstantIntVal !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -213,7 +213,7 @@ Val* maybeSubstituteGenericParam(Val* paramVal, Decl* paramDecl, SubstitutionSet
     Count argCount = args.getCount();
 
     Count argIndex = 0;
-    for (auto m : outerGeneric->members)
+    for (auto m : outerGeneric->getDirectMemberDecls())
     {
         // If we have run out of arguments, then we can stop
         // iterating over the parameters, because `this`
@@ -541,17 +541,15 @@ Val* DeclaredSubtypeWitness::_substituteImplOverride(
 
         bool found = false;
         Index index = 0;
-        for (auto m : genericDecl->members)
+        for (auto constraintParam :
+             genericDecl->getDirectMemberDeclsOfType<GenericTypeConstraintDecl>())
         {
-            if (auto constraintParam = as<GenericTypeConstraintDecl>(m))
+            if (constraintParam == getDeclRef().getDecl())
             {
-                if (constraintParam == getDeclRef().getDecl())
-                {
-                    found = true;
-                    break;
-                }
-                index++;
+                found = true;
+                break;
             }
+            index++;
         }
         if (found)
         {
@@ -895,6 +893,18 @@ Val* TypeCoercionWitness::_resolveImplOverride()
     {
         return getCurrentASTBuilder()->getTypeCoercionWitness(newFrom, newTo, newDeclRef);
     }
+    return this;
+}
+
+// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! NoneWitness !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+void NoneWitness::_toTextOverride(StringBuilder& out)
+{
+    out.append("none");
+}
+
+Val* NoneWitness::_resolveImplOverride()
+{
     return this;
 }
 

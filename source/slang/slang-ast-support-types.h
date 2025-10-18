@@ -1,5 +1,4 @@
-#ifndef SLANG_AST_SUPPORT_TYPES_H
-#define SLANG_AST_SUPPORT_TYPES_H
+#pragma once
 
 #include "../compiler-core/slang-doc-extractor.h"
 #include "../compiler-core/slang-lexer.h"
@@ -7,13 +6,15 @@
 #include "../core/slang-basic.h"
 #include "../core/slang-semantic-version.h"
 #include "slang-ast-forward-declarations.h"
-#include "slang-ast-support-types.h.fiddle"
 #include "slang-profile.h"
 #include "slang-type-system-shared.h"
 #include "slang.h"
 
 #include <assert.h>
 #include <type_traits>
+
+//
+#include "slang-ast-support-types.h.fiddle"
 
 FIDDLE(hidden class RefObject;)
 
@@ -123,6 +124,7 @@ FIDDLE() namespace Slang
         kConversionCost_ValToOptional = 150,
         kConversionCost_NullPtrToPtr = 150,
         kConversionCost_PtrToVoidPtr = 150,
+        kConversionCost_FailedOptionalConstraint = 150,
 
         // Conversions that are lossless, but change "kind"
         kConversionCost_UnsignedToSignedPromotion = 200,
@@ -219,6 +221,25 @@ FIDDLE() namespace Slang
 
     char const* getGLSLNameForImageFormat(ImageFormat format);
 
+    /// Enum for known built-in function names to replace string-based comparisons
+    enum class KnownBuiltinDeclName : uint32_t
+    {
+        GeometryStreamAppend,
+        GeometryStreamRestart,
+        GetAttributeAtVertex,
+        DispatchMesh,
+        saturated_cooperation,
+        saturated_cooperation_using,
+        IDifferentiable,
+        IDifferentiablePtr,
+        NullDifferential,
+        OperatorAddressOf,
+        COUNT
+    };
+
+    /// Convert string name to KnownBuiltinDeclName enum
+    KnownBuiltinDeclName getKnownBuiltinDeclNameFromString(UnownedStringSlice name);
+
     // TODO(tfoley): We should ditch this enumeration
     // and just use the IR opcodes that represent these
     // types directly. The one major complication there
@@ -232,10 +253,12 @@ FIDDLE() namespace Slang
     class Val;
 
     // Helper type for pairing up a name and the location where it appeared
-    struct NameLoc
+    FIDDLE() struct NameLoc
     {
-        Name* name;
-        SourceLoc loc;
+        FIDDLE(...)
+
+        FIDDLE() Name* name;
+        FIDDLE() SourceLoc loc;
 
         NameLoc()
             : name(nullptr)
@@ -572,10 +595,11 @@ FIDDLE() namespace Slang
     struct QualType
     {
         FIDDLE(...)
-        Type* type = nullptr;
-        bool isLeftValue = false;
-        bool hasReadOnlyOnTarget = false;
-        bool isWriteOnly = false;
+
+        FIDDLE() Type* type = nullptr;
+        FIDDLE() bool isLeftValue = false;
+        FIDDLE() bool hasReadOnlyOnTarget = false;
+        FIDDLE() bool isWriteOnly = false;
 
         QualType() = default;
 
@@ -600,10 +624,22 @@ FIDDLE() namespace Slang
     typedef SyntaxClassBase ReflectClassInfo;
     typedef SyntaxClassBase ASTClassInfo;
 
+    enum class SyntaxClassInfoDebugVisType
+    {
+        Decl,
+        Expr,
+        Modifier,
+        Stmt,
+        Val,
+        Scope,
+        Unknown,
+    };
+
     struct SyntaxClassInfo
     {
     public:
         char const* name;
+        SyntaxClassInfoDebugVisType debugVisType;
         ASTNodeType firstTag;
         Count tagCount;
         void* (*createFunc)(ASTBuilder*);
@@ -1096,12 +1132,6 @@ FIDDLE() namespace Slang
         MemberFilterStyle m_filterStyle;
     };
 
-    struct TransparentMemberInfo
-    {
-        // The declaration of the transparent member
-        Decl* decl = nullptr;
-    };
-
     template<typename T>
     struct FilteredMemberRefList
     {
@@ -1230,6 +1260,7 @@ FIDDLE() namespace Slang
         Type* Ptr() { return type; }
         operator Type*() { return type; }
         Type* operator->() { return Ptr(); }
+        explicit operator bool() const { return type != nullptr; }
 
         ThisType& operator=(const ThisType& rhs) = default;
 
@@ -1577,16 +1608,16 @@ FIDDLE() namespace Slang
         void add(Decl* decl, RequirementWitness const& witness);
 
         // The type that the witness table witnesses conformance to (e.g. an Interface)
-        Type* baseType;
+        FIDDLE() Type* baseType;
 
         // The type witnessesd by the witness table (a concrete type).
-        Type* witnessedType;
+        FIDDLE() Type* witnessedType;
 
         // Whether or not this witness table is an extern declaration.
-        bool isExtern = false;
+        FIDDLE() bool isExtern = false;
 
         // Cached dictionary for looking up satisfying values.
-        RequirementDictionary m_requirementDictionary;
+        FIDDLE() RequirementDictionary m_requirementDictionary;
 
         RefPtr<WitnessTable> specialize(ASTBuilder* astBuilder, SubstitutionSet const& subst);
     };
@@ -1609,6 +1640,7 @@ FIDDLE() namespace Slang
     struct SpecializationArg
     {
         Val* val = nullptr;
+        Expr* expr = nullptr;
     };
     typedef List<SpecializationArg> SpecializationArgs;
 
@@ -1640,8 +1672,9 @@ FIDDLE() namespace Slang
     class DeclAssociation : public RefObject
     {
         FIDDLE(...)
-        DeclAssociationKind kind;
-        Decl* decl;
+
+        FIDDLE() DeclAssociationKind kind;
+        FIDDLE() Decl* decl;
     };
 
     /// A reference-counted object to hold a list of associated decls for a decl.
@@ -1654,16 +1687,96 @@ FIDDLE() namespace Slang
     };
 
     /// Represents the "direction" that a parameter is being passed (e.g., `in` or `out`
-    enum ParameterDirection
+    enum class ParamPassingMode
     {
-        kParameterDirection_In,       ///< Copy in
-        kParameterDirection_Out,      ///< Copy out
-        kParameterDirection_InOut,    ///< Copy in, copy out
-        kParameterDirection_Ref,      ///< By-reference
-        kParameterDirection_ConstRef, ///< By-const-reference
+        /// Pass a value as input.
+        ///
+        /// Indicated by using the `in` modifier on a parameter,
+        /// or simply using no modifier (on a parameter of
+        /// copyable type). This is the default mode.
+        ///
+        /// Must (almost by definition) be passed a copy
+        /// of the argument.
+        ///
+        ///
+        In,
+
+        /// Pass a reference to a memory location, to be used for output.
+        ///
+        /// Indicated by using the `out` modifier on a parameter
+        /// (while not also using `in`).
+        ///
+        /// May semantically be implemented by directly passing a
+        /// reference to the argument, or a reference to a temporary
+        /// that is moved out of after the call.
+        ///
+        /// Storage at the passed-in address should be unintialized
+        /// on input, and will be must be initialized by the callee
+        /// on any normal return path. On an error return, the storage
+        /// must be uninitialized.
+        ///
+        Out,
+
+        /// Pass a reference to a borrowed immutable value.
+        ///
+        /// Indicated by using the `borrow` modifier on a parameter,
+        /// or the combination of `borrow` and `in` (while not also
+        /// using `out`).
+        ///
+        /// May semantically be implemented by directly passing a
+        /// reference to the argument, or a reference to a temporary
+        /// that is moved/copied into before the call.
+        ///
+        /// Storage at the passed-in address must be guaranteed (by
+        /// the caller) to be immutable for the duration of the call.
+        ///
+        BorrowIn,
+
+        /// Pass a reference to a borrowed mutable value.
+        ///
+        /// Indicated by using the `inout` modifier on a parameter,
+        /// or the combination of `in` and `out`; may also be combined
+        /// with `borrow` to make the semantics more clear.
+        ///
+        /// May semantically be implemented by directly passing a
+        /// reference to the argument, or a reference to a temporary
+        /// that is moved/copied into before the call, and then
+        /// moved/copied out of after the call.
+        ///
+        /// Storage at the passed-in address must be guaranteed (by
+        /// the caller) to not be be accessed (including both reads
+        /// and writes) via any other potentially-aliasing access path.
+        /// Put another way, the callee has exclusive access to the
+        /// memory location for the duration of the call.
+        ///
+        BorrowInOut,
+
+        /// Pass a reference to a mutable memory location.
+        ///
+        /// Indicated by using the `ref` modifier on a parmater
+        /// (without also using the `readonly` or `writeonly` modifiers).
+        ///
+        /// Must be implemented by directly passing a reference to
+        /// the memory location of the argument. It is an error if
+        /// an argument resolves to a storage location that is not
+        /// a memory location (and cannot be turned into a memory
+        /// location via, e.g., a `ref` accessor).
+        ///
+        /// The memory location at the passed-in address may be
+        /// accessed (for reads, writes, atomics, etc.) during the
+        /// duration of the call, through access paths that alias
+        /// the parameter. The callee does not have a guarantee
+        /// of exclusivity of access to the memory location, and
+        /// must take appropriate precautions to ensure consistency,
+        /// coherency, and synchronization of access.
+        ///
+        /// This parameter-passing mode is more-or-less just syntactic
+        /// sugar for a parameter of an explicit pointer type (`Ptr<T>`).
+        ///
+        Ref,
     };
 
-    void printDiagnosticArg(StringBuilder & sb, ParameterDirection direction);
+    void printDiagnosticArg(StringBuilder & sb, ParamPassingMode direction);
 
     /// The kind of a builtin interface requirement that can be automatically synthesized.
     enum class BuiltinRequirementKind
@@ -1732,5 +1845,3 @@ FIDDLE() namespace Slang
     };
 
 } // namespace Slang
-
-#endif

@@ -27,7 +27,7 @@ Type* getPointedToTypeIfCanImplicitDeref(Type* type)
     {
         return ptrType->getValueType();
     }
-    else if (auto refType = as<RefType>(type))
+    else if (auto refType = as<ExplicitRefType>(type))
     {
         return refType->getValueType();
     }
@@ -146,6 +146,7 @@ Type* SemanticsVisitor::ExtractGenericArgType(Expr* exp)
 IntVal* SemanticsVisitor::ExtractGenericArgInteger(
     Expr* exp,
     Type* genericParamType,
+    ConstantFoldingKind kind,
     DiagnosticSink* sink)
 {
     IntVal* val = CheckIntegerConstantExpression(
@@ -153,7 +154,7 @@ IntVal* SemanticsVisitor::ExtractGenericArgInteger(
         genericParamType ? IntegerConstantExpressionCoercionType::SpecificType
                          : IntegerConstantExpressionCoercionType::AnyInteger,
         genericParamType,
-        ConstantFoldingKind::SpecializationConstant,
+        kind,
         sink);
     if (val)
         return val;
@@ -168,7 +169,11 @@ IntVal* SemanticsVisitor::ExtractGenericArgInteger(
 
 IntVal* SemanticsVisitor::ExtractGenericArgInteger(Expr* exp, Type* genericParamType)
 {
-    return ExtractGenericArgInteger(exp, genericParamType, getSink());
+    return ExtractGenericArgInteger(
+        exp,
+        genericParamType,
+        ConstantFoldingKind::LinkTime,
+        getSink());
 }
 
 Val* SemanticsVisitor::ExtractGenericArgVal(Expr* exp)
@@ -294,7 +299,7 @@ bool SemanticsVisitor::CoerceToProperTypeImpl(
         ensureDecl(genericDeclRef, DeclCheckState::CanSpecializeGeneric);
         List<Val*> args;
         List<Val*> witnessArgs;
-        for (Decl* member : genericDeclRef.getDecl()->members)
+        for (Decl* member : genericDeclRef.getDecl()->getDirectMemberDecls())
         {
             if (auto typeParam = as<GenericTypeParamDecl>(member))
             {
@@ -333,43 +338,36 @@ bool SemanticsVisitor::CoerceToProperTypeImpl(
             }
         }
 
-        for (Decl* member : genericDeclRef.getDecl()->members)
+        for (auto constraintParam :
+             genericDeclRef.getDecl()->getDirectMemberDeclsOfType<GenericTypeConstraintDecl>())
         {
-            if (auto constraintParam = as<GenericTypeConstraintDecl>(member))
+            auto genericParam = as<DeclRefType>(constraintParam->sub.type)->getDeclRef();
+            if (!genericParam)
+                return false;
+            auto genericTypeParamDecl = as<GenericTypeParamDecl>(genericParam.getDecl());
+            if (!genericTypeParamDecl)
             {
-                auto genericParam = as<DeclRefType>(constraintParam->sub.type)->getDeclRef();
-                if (!genericParam)
-                    return false;
-                auto genericTypeParamDecl = as<GenericTypeParamDecl>(genericParam.getDecl());
-                if (!genericTypeParamDecl)
-                {
-                    diagSink->diagnose(typeExp.exp, Diagnostics::genericTypeNeedsArgs, typeExp);
-                    return false;
-                }
-                auto defaultType = CheckProperType(genericTypeParamDecl->initType);
-                if (!defaultType)
-                {
-                    diagSink->diagnose(typeExp.exp, Diagnostics::genericTypeNeedsArgs, typeExp);
-                    return false;
-                }
-                auto witness =
-                    tryGetSubtypeWitness(defaultType, CheckProperType(constraintParam->sup));
-                if (!witness)
-                {
-                    // diagnose
-                    getSink()->diagnose(
-                        genericTypeParamDecl->initType.exp,
-                        Diagnostics::typeArgumentDoesNotConformToInterface,
-                        defaultType,
-                        constraintParam->sup);
-                    return false;
-                }
-                witnessArgs.add(witness);
+                diagSink->diagnose(typeExp.exp, Diagnostics::genericTypeNeedsArgs, typeExp);
+                return false;
             }
-            else
+            auto defaultType = CheckProperType(genericTypeParamDecl->initType);
+            if (!defaultType)
             {
-                // ignore non-parameter members
+                diagSink->diagnose(typeExp.exp, Diagnostics::genericTypeNeedsArgs, typeExp);
+                return false;
             }
+            auto witness = tryGetSubtypeWitness(defaultType, CheckProperType(constraintParam->sup));
+            if (!witness)
+            {
+                // diagnose
+                getSink()->diagnose(
+                    genericTypeParamDecl->initType.exp,
+                    Diagnostics::typeArgumentDoesNotConformToInterface,
+                    defaultType,
+                    constraintParam->sup);
+                return false;
+            }
+            witnessArgs.add(witness);
         }
         // Combine args and witnessArgs
         args.addRange(witnessArgs);

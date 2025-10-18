@@ -46,3 +46,5 @@
 {45, "Kitsunebi Games", "Nuvk SPIR-V Emitter and DLSL compiler", "Kitsunebi Games Nuvk SPIR-V Emitter and DLSL compiler"},
 {46, "Nintendo", "", "Nintendo"},
 {47, "ARM", "", "ARM"},
+{48, "Goopax", "", "Goopax"},
+{49, "Icyllis Milica", "Arc3D Shader Compiler", "Icyllis Milica Arc3D Shader Compiler"},

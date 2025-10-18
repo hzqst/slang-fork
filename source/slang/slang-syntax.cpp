@@ -912,28 +912,41 @@ FuncType* getFuncType(ASTBuilder* astBuilder, DeclRef<CallableDecl> const& declR
 {
     List<Type*> paramTypes;
     auto resultType = getResultType(astBuilder, declRef);
+
+    if (!resultType)
+        resultType = astBuilder->getErrorType();
+
     auto errorType = getErrorCodeType(astBuilder, declRef);
     auto visitParamDecl = [&](DeclRef<ParamDecl> paramDeclRef)
     {
         auto paramDecl = paramDeclRef.getDecl();
         auto paramType = getParamType(astBuilder, paramDeclRef);
+        if (!paramType)
+        {
+            paramType = astBuilder->getErrorType();
+        }
+
+        // TODO(tfoley): This code should first compute the appropriate
+        // parameter-passing mode ("direction") for the `paramDecl` and
+        // then use that mode to decide which wrapper type to use.
+        //
         if (paramDecl->findModifier<RefModifier>())
         {
-            paramType = astBuilder->getRefType(paramType, AddressSpace::Generic);
+            paramType = astBuilder->getRefParamType(paramType);
         }
-        else if (paramDecl->findModifier<ConstRefModifier>())
+        else if (paramDecl->findModifier<BorrowModifier>())
         {
-            paramType = astBuilder->getConstRefType(paramType);
+            paramType = astBuilder->getConstRefParamType(paramType);
         }
         else if (paramDecl->findModifier<OutModifier>())
         {
             if (paramDecl->findModifier<InOutModifier>() || paramDecl->findModifier<InModifier>())
             {
-                paramType = astBuilder->getInOutType(paramType);
+                paramType = astBuilder->getBorrowInOutParamType(paramType);
             }
             else
             {
-                paramType = astBuilder->getOutType(paramType);
+                paramType = astBuilder->getOutParamType(paramType);
             }
         }
         paramTypes.add(paramType);
@@ -1093,44 +1106,44 @@ ModuleDecl* getModuleDecl(Scope* scope)
     return nullptr;
 }
 
-Decl* getParentDecl(Decl* decl)
+ContainerDecl* getParentDecl(Decl* decl)
 {
-    decl = decl->parentDecl;
-    while (as<GenericDecl>(decl))
-        decl = decl->parentDecl;
-    return decl;
+    auto parentDecl = decl->parentDecl;
+    while (auto genericDecl = as<GenericDecl>(parentDecl))
+        parentDecl = genericDecl->parentDecl;
+    return parentDecl;
 }
 
-Decl* getParentAggTypeDecl(Decl* decl)
+AggTypeDecl* getParentAggTypeDecl(Decl* decl)
 {
     decl = decl->parentDecl;
     while (decl)
     {
-        if (as<AggTypeDecl>(decl))
-            return decl;
-        decl = decl->parentDecl;
-    }
-    return nullptr;
-}
-
-Decl* getParentAggTypeDeclBase(Decl* decl)
-{
-    decl = decl->parentDecl;
-    while (decl)
-    {
-        if (as<AggTypeDeclBase>(decl))
-            return decl;
+        if (auto found = as<AggTypeDecl>(decl))
+            return found;
         decl = decl->parentDecl;
     }
     return nullptr;
 }
 
-Decl* getParentFunc(Decl* decl)
+AggTypeDeclBase* getParentAggTypeDeclBase(Decl* decl)
+{
+    decl = decl->parentDecl;
+    while (decl)
+    {
+        if (auto found = as<AggTypeDeclBase>(decl))
+            return found;
+        decl = decl->parentDecl;
+    }
+    return nullptr;
+}
+
+FunctionDeclBase* getParentFunc(Decl* decl)
 {
     while (decl)
     {
-        if (as<FunctionDeclBase>(decl))
-            return decl;
+        if (auto found = as<FunctionDeclBase>(decl))
+            return found;
         decl = decl->parentDecl;
     }
     return nullptr;
@@ -1185,8 +1198,15 @@ bool findVkImageFormatByName(const UnownedStringSlice& name, ImageFormat* outFor
     if (name.endsWith(kSNorm))
     {
         StringBuilder buf;
-        //  format names end with snormal after a '_', so replace with that
-        buf << name.head(name.getLength() - kSNorm.getLength()) << "_" << kSNorm;
+        auto prefix = name.head(name.getLength() - kSNorm.getLength());
+        buf << prefix;
+        // format names end with snormal after a '_', so add an underscore
+        // if the prefix doesn't already end with one
+        if (prefix.getLength() == 0 || prefix[prefix.getLength() - 1] != '_')
+        {
+            buf << "_";
+        }
+        buf << kSNorm;
         return findImageFormatByName(buf.getUnownedSlice(), outFormat);
     }
 

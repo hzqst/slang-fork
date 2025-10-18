@@ -32,10 +32,18 @@ void legalizeImageStoreValue(IRBuilder& builder, IRImageStore* imageStore)
             }
         }
         elementType = valueVectorType->getElementType();
-        auto vectorValue = as<IRMakeVector>(originalValue);
-        for (UInt i = 0; i < vectorValue->getOperandCount(); i++)
+
+        // Extract components using IRElementExtract to handle any vector instruction type
+        if (auto originalElementCount = as<IRIntLit>(valueVectorType->getElementCount()))
         {
-            components.add(vectorValue->getOperand(i));
+            for (UInt i = 0; i < (UInt)originalElementCount->getValue(); i++)
+            {
+                auto elementExtract = builder.emitElementExtract(
+                    elementType,
+                    originalValue,
+                    builder.getIntValue(builder.getIntType(), i));
+                components.add(elementExtract);
+            }
         }
     }
     else
@@ -127,6 +135,16 @@ struct MetalAddressSpaceAssigner : InitialAddressSpaceAssigner
         case kIROp_RWStructuredBufferGetElementPtr:
             outAddressSpace = AddressSpace::Global;
             return true;
+        case kIROp_Load:
+            {
+                auto addrSpace = getAddressSpaceFromVarType(inst->getDataType());
+                if (addrSpace != AddressSpace::Generic)
+                {
+                    outAddressSpace = addrSpace;
+                    return true;
+                }
+            }
+            return false;
         default:
             return false;
         }
@@ -154,7 +172,7 @@ struct MetalAddressSpaceAssigner : InitialAddressSpaceAssigner
         {
             if (ptrType->hasAddressSpace())
                 return ptrType->getAddressSpace();
-            return AddressSpace::Global;
+            return AddressSpace::Generic;
         }
         return AddressSpace::Generic;
     }
@@ -206,6 +224,9 @@ static void processInst(IRInst* inst, DiagnosticSink* sink)
     case kIROp_Leq:
         legalizeBinaryOp(inst, sink, CodeGenTarget::Metal);
         break;
+    case kIROp_MeshOutputRef:
+        sink->diagnose(getDiagnosticPos(inst), Diagnostics::assignToRefNotSupported);
+        break;
     case kIROp_MetalCastToDepthTexture:
         {
             // If the operand is already a depth texture, don't do anything.
@@ -245,10 +266,13 @@ void legalizeIRForMetal(IRModule* module, DiagnosticSink* sink)
 
     legalizeEntryPointVaryingParamsForMetal(module, sink, entryPoints);
 
+    processInst(module->getModuleInst(), sink);
+}
+
+void specializeAddressSpaceForMetal(IRModule* module)
+{
     MetalAddressSpaceAssigner metalAddressSpaceAssigner;
     specializeAddressSpace(module, &metalAddressSpaceAssigner);
-
-    processInst(module->getModuleInst(), sink);
 }
 
 } // namespace Slang

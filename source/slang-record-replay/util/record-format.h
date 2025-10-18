@@ -30,6 +30,7 @@ enum ApiClassId : uint16_t
     Class_IEntryPoint = 5,
     Class_ICompositeComponentType = 6,
     Class_ITypeConformance = 7,
+    Class_IComponentType2 = 8,
     Unknown = 0xFFFF
 };
 
@@ -57,6 +58,9 @@ enum IComponentTypeMethodId : uint16_t
     getEntryPointHostCallable = 0x0013,
     renameEntryPoint = 0x0014,
     linkWithOptions = 0x0015,
+    getTargetCompileResult = 0x0016,
+    getEntryPointCompileResult = 0x0017,
+    queryInterface = 0x0018,
 };
 
 enum ApiCallId : uint32_t
@@ -111,7 +115,6 @@ enum ApiCallId : uint32_t
     ISession_getLoadedModuleCount = makeApiCallId(Class_ISession, 0x0011),
     ISession_getLoadedModule = makeApiCallId(Class_ISession, 0x0012),
     ISession_isBinaryModuleUpToDate = makeApiCallId(Class_ISession, 0x0013),
-
 
     IModule_findEntryPointByName = makeApiCallId(Class_IModule, 0x0001),
     IModule_getDefinedEntryPointCount = makeApiCallId(Class_IModule, 0x0002),
@@ -190,6 +193,8 @@ enum ApiCallId : uint32_t
         makeApiCallId(Class_ICompositeComponentType, IComponentTypeMethodId::renameEntryPoint),
     ICompositeComponentType_linkWithOptions =
         makeApiCallId(Class_ICompositeComponentType, IComponentTypeMethodId::linkWithOptions),
+    ICompositeComponentType_queryInterface =
+        makeApiCallId(Class_ICompositeComponentType, IComponentTypeMethodId::queryInterface),
 
     ITypeConformance_getSession =
         makeApiCallId(Class_ITypeConformance, IComponentTypeMethodId::getSession),
@@ -214,6 +219,12 @@ enum ApiCallId : uint32_t
         makeApiCallId(Class_ITypeConformance, IComponentTypeMethodId::renameEntryPoint),
     ITypeConformance_linkWithOptions =
         makeApiCallId(Class_ITypeConformance, IComponentTypeMethodId::linkWithOptions),
+
+    // IComponentType2 methods.
+    IComponentType2_getTargetCompileResult =
+        makeApiCallId(Class_IComponentType2, IComponentTypeMethodId::getTargetCompileResult),
+    IComponentType2_getEntryPointCompileResult =
+        makeApiCallId(Class_IComponentType2, IComponentTypeMethodId::getEntryPointCompileResult),
 };
 
 struct FunctionHeader

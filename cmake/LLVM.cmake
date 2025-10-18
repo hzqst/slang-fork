@@ -60,7 +60,7 @@ function(fetch_or_build_slang_llvm)
             endif()
         endif()
     elseif(SLANG_SLANG_LLVM_FLAVOR STREQUAL "USE_SYSTEM_LLVM")
-        find_package(LLVM 13.0 REQUIRED CONFIG)
+        find_package(LLVM 14.0 REQUIRED CONFIG)
         find_package(Clang REQUIRED CONFIG)
 
         llvm_target_from_components(llvm-dep filecheck native orcjit)
@@ -92,6 +92,10 @@ function(fetch_or_build_slang_llvm)
         )
         # If we don't include this, then the symbols in the LLVM linked here may
         # conflict with those of other LLVMs linked at runtime, for instance in mesa.
+        set_target_properties(
+            slang-llvm
+            PROPERTIES CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON
+        )
         add_supported_cxx_linker_flags(
             slang-llvm
             PRIVATE
@@ -104,22 +108,16 @@ function(fetch_or_build_slang_llvm)
         endif()
 
         # TODO: Put a check here that libslang-llvm.so doesn't have a 'NEEDED'
-        # directive for libLLVM-13.so, it's almost certainly going to break at
+        # directive for libLLVM-14.so, it's almost certainly going to break at
         # runtime in surprising ways when linked alongside Mesa (or anything else
         # pulling in libLLVM.so)
     endif()
 
     if(SLANG_ENABLE_PREBUILT_BINARIES)
         if(CMAKE_SYSTEM_NAME MATCHES "Windows")
-            # DX Agility SDK requires the D3D12*.DLL files to be placed under a sub-directory, "D3D12".
-            # https://devblogs.microsoft.com/directx/gettingstarted-dx12agility/#d3d12sdkpath-should-not-be-the-same-directory-as-the-application-exe
             file(
                 GLOB prebuilt_binaries
                 "${slang_SOURCE_DIR}/external/slang-binaries/bin/windows-x64/*"
-            )
-            file(
-                GLOB prebuilt_d3d12_binaries
-                "${slang_SOURCE_DIR}/external/slang-binaries/bin/windows-x64/[dD]3[dD]12*"
             )
             list(REMOVE_ITEM prebuilt_binaries ${prebuilt_d3d12_binaries})
             add_custom_target(
@@ -131,13 +129,6 @@ function(fetch_or_build_slang_llvm)
                 COMMAND
                     ${CMAKE_COMMAND} -E copy_if_different ${prebuilt_binaries}
                     ${CMAKE_BINARY_DIR}/$<CONFIG>/${runtime_subdir}
-                COMMAND
-                    ${CMAKE_COMMAND} -E make_directory
-                    ${CMAKE_BINARY_DIR}/$<CONFIG>/${runtime_subdir}/D3D12
-                COMMAND
-                    ${CMAKE_COMMAND} -E copy_if_different
-                    ${prebuilt_d3d12_binaries}
-                    ${CMAKE_BINARY_DIR}/$<CONFIG>/${runtime_subdir}/D3D12
                 VERBATIM
             )
             set_target_properties(

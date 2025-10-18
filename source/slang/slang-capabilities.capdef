@@ -152,7 +152,7 @@ def glsl_spirv_1_6 : glsl_spirv_1_5;
 
 // We have multiple capabilities for the various SPIR-V versions,
 // arranged so that they inherit from one another to represent which versions
-// provide a super-set of the features of earlier ones (e.g., SPIR-V 1.4 is
+// provide a superset of the features of earlier ones (e.g., SPIR-V 1.4 is
 // expressed as inheriting from SPIR-V 1.3).
 
 def _spirv_1_0 : spirv;
@@ -220,11 +220,11 @@ def _sm_6_9 : _sm_6_8;
 def hlsl_nvapi : hlsl;
 
 
-/// Represet HLSL compatibility support.
+/// Represent HLSL compatibility support.
 /// [Version]
 def hlsl_2018 : _sm_5_1;
 
-/// Represet compatibility support for the deprecated POC DXC
+/// Represent compatibility support for the deprecated POC DXC
 /// [Version]
 def hlsl_coopvec_poc : _sm_6_8;
 
@@ -244,6 +244,8 @@ def _cuda_sm_6_0 : _cuda_sm_5_0;
 def _cuda_sm_7_0 : _cuda_sm_6_0;
 def _cuda_sm_8_0 : _cuda_sm_7_0;
 def _cuda_sm_9_0 : _cuda_sm_8_0;
+/// Represents capabilities required for optix cooperative vector support.
+def optix_coopvec : _cuda_sm_9_0;
 
 /// All code-gen targets
 /// [Compound]
@@ -268,6 +270,10 @@ alias cpp_cuda = cpp | cuda;
 /// CPP, CUDA and SPIRV code-gen targets
 /// [Compound]
 alias cpp_cuda_spirv = cpp | cuda | spirv;
+
+/// CPP, CUDA, Metal, and SPIRV code-gen targets
+/// [Compound]
+alias cpp_cuda_metal_spirv = cpp | cuda | metal | spirv;
 
 /// CUDA and SPIRV code-gen targets
 /// [Compound]
@@ -509,6 +515,10 @@ def SPV_KHR_fragment_shader_barycentric : _spirv_1_0;
 /// [EXT]
 def SPV_KHR_non_semantic_info : _spirv_1_0;
 
+/// Represents the SPIR-V extension for device-group information.
+/// [EXT]
+def SPV_KHR_device_group : _spirv_1_0;
+
 /// Represents the SPIR-V extension for ray tracing.
 /// [EXT]
 def SPV_KHR_ray_tracing : _spirv_1_4;
@@ -591,8 +601,15 @@ def SPV_NV_tensor_addressing : _spirv_1_6;
 /// [EXT]
 def SPV_NV_cooperative_matrix2 : SPV_NV_tensor_addressing + SPV_KHR_cooperative_matrix;
 
+/// Represents the SPIR-V extension for SPV_NV_bindless_texture.
+/// [EXT]
+def SPV_NV_bindless_texture: _spirv_1_0;
 
 // SPIRV Capabilities.
+
+/// Represents the SPIR-V capability for DeviceGroup.
+/// [EXT]
+def spvDeviceGroup : SPV_KHR_device_group;
 
 /// Represents the SPIR-V capability for atomic float 32 add operations.
 /// [EXT]
@@ -798,6 +815,10 @@ def spvVulkanMemoryModelKHR : SPV_KHR_vulkan_memory_model;
 /// [EXT]
 def spvVulkanMemoryModelDeviceScopeKHR : SPV_KHR_vulkan_memory_model;
 
+/// Represents the SPIR-V capability for the bindless texture.
+/// [EXT]
+def spvBindlessTextureNV : SPV_NV_bindless_texture;
+
 // The following capabilities all pertain to how ray tracing shaders are translated
 // to GLSL, where there are two different extensions that can provide the core
 // functionality of `TraceRay` and the related operations.
@@ -838,6 +859,7 @@ def _GL_EXT_texture_query_lod : glsl;
 def _GL_EXT_texture_shadow_lod : _GLSL_130;
 def _GL_EXT_maximal_reconvergence : _GLSL_140;
 def _GL_EXT_shader_quad_control : _GLSL_140;
+def _GL_EXT_device_group : _GLSL_140;
 
 def _GL_ARB_derivative_control : _GLSL_400;
 def _GL_ARB_fragment_shader_interlock : _GLSL_450;
@@ -876,6 +898,7 @@ def _GL_NV_shader_invocation_reorder : _GLSL_460;
 def _GL_NV_shader_subgroup_partitioned : _GLSL_140;
 def _GL_NV_shader_texture_footprint : _GLSL_450;
 def _GL_NV_cluster_acceleration_structure : _GLSL_460;
+def _GL_NV_cooperative_vector : _GLSL_450;
 
 // GLSL extension and SPV extension associations.
 
@@ -902,6 +925,10 @@ alias GL_EXT_maximal_reconvergence = _GL_EXT_maximal_reconvergence | spvMaximalR
 /// Represents the GL_EXT_shader_quad_control extension.
 /// [EXT]
 alias GL_EXT_shader_quad_control = _GL_EXT_shader_quad_control | spvQuadControlKHR;
+
+/// Represents the GL_EXT_device_group extension.
+/// [EXT]
+alias GL_EXT_device_group = _GL_EXT_device_group | spvDeviceGroup;
 
 /// Represents the GL_EXT_fragment_shader_barycentric extension.
 /// [EXT]
@@ -1119,6 +1146,10 @@ alias GL_NV_shader_texture_footprint = _GL_NV_shader_texture_footprint | spvImag
 /// [EXT]
 alias GL_NV_cluster_acceleration_structure = _GL_NV_cluster_acceleration_structure | spvRayTracingClusterAccelerationStructureNV;
 
+/// Represents the GL_NV_cooperative_vector extension.
+/// [EXT]
+alias GL_NV_cooperative_vector = _GL_NV_cooperative_vector | spvCooperativeVectorNV + spvCooperativeVectorTrainingNV;
+
 // Define feature names not reliant on shader stages
 
 /// NVAPI capability for HLSL
@@ -1161,7 +1192,7 @@ alias atomicfloat = GL_EXT_shader_atomic_float | _sm_6_0 + hlsl_nvapi | cpp | cu
 alias atomicfloat2 = GL_EXT_shader_atomic_float2 | _sm_6_6 + hlsl_nvapi | cpp | cuda;
 /// Capabilities needed to use fragment-shader-barycentric's
 /// [Compound]
-alias fragmentshaderbarycentric = GL_EXT_fragment_shader_barycentric | _sm_6_1;
+alias fragmentshaderbarycentric = GL_EXT_fragment_shader_barycentric | _sm_6_1 | metal;
 ///  (gfx targets) Capabilities needed to use memory barriers
 /// [Compound]
 alias shadermemorycontrol = glsl | _spirv_1_0 | _sm_5_0;
@@ -1175,11 +1206,10 @@ alias bufferreference_int64 = bufferreference + GL_EXT_shader_explicit_arithmeti
 /// Note that cpp and cuda are supported via a fallback non-cooperative implementation
 /// No HLSL shader model bound yet
 /// [Compound]
-alias cooperative_vector = _sm_6_9 | cpp | _cuda_sm_9_0 | spvCooperativeVectorNV;
+alias cooperative_vector = _sm_6_9 | cpp | _cuda_sm_9_0 | spvCooperativeVectorNV | _GL_NV_cooperative_vector;
 /// Capabilities needed to train cooperative vectors
 /// [Compound]
-alias cooperative_vector_training = spvCooperativeVectorTrainingNV;
-
+alias cooperative_vector_training = spvCooperativeVectorTrainingNV | _GL_NV_cooperative_vector;
 /// Capabilities needed to use cooperative matrices
 /// [Compound]
 alias cooperative_matrix = spvCooperativeMatrixKHR;
@@ -1254,6 +1284,10 @@ alias miss = _miss + raytracing;
 /// Mesh shader stage & mesh shader capabilities
 /// [Stage]
 alias mesh = _mesh + _meshshading;
+
+/// Task shader stage & mesh shader capabilities
+/// [Stage]
+alias task = _amplification + _meshshading;
 
 /// Amplification shader stage & mesh shader capabilities
 /// [Stage]
@@ -1472,7 +1506,7 @@ alias sm_4_1 = sm_4_1_version
 alias sm_5_0_version = _sm_5_0 
              | _GLSL_330
              | spirv_1_0
-             | _cuda_sm_9_0
+             | _cuda_sm_6_0
              | metal
              | wgsl
              | cpp
@@ -1493,7 +1527,7 @@ alias sm_5_0 = sm_5_0_version
 alias sm_5_1_version = _sm_5_1
              | _GLSL_330
              | spirv_1_0
-             | _cuda_sm_9_0
+             | _cuda_sm_6_0
              | metal
              | cpp
              ;
@@ -1512,7 +1546,7 @@ alias sm_5_1 = sm_5_1_version
 alias sm_6_0_version = _sm_6_0 
              | _GLSL_450
              | spirv_1_3
-             | _cuda_sm_9_0 
+             | _cuda_sm_6_0 
              | metal
              | cpp
              ;
@@ -1531,7 +1565,7 @@ alias sm_6_0 = sm_6_0_version
 alias sm_6_1_version = _sm_6_1 
              | _GLSL_450 
              | spirv_1_3 
-             | _cuda_sm_9_0
+             | _cuda_sm_7_0
              | metal
              | cpp
              ;
@@ -1550,7 +1584,7 @@ alias sm_6_1 = sm_6_1_version
 alias sm_6_2_version = _sm_6_2
              | _GLSL_450
              | spirv_1_3
-             | _cuda_sm_9_0
+             | _cuda_sm_7_0
              | metal
              | cpp
              ;
@@ -1568,7 +1602,7 @@ alias sm_6_2 = sm_6_2_version
 alias sm_6_3_version = _sm_6_3
              | _GLSL_460 
              | spirv_1_4
-             | _cuda_sm_9_0
+             | _cuda_sm_7_0
              | metal
              | cpp
              ;
@@ -1587,7 +1621,7 @@ alias sm_6_3 = sm_6_3_version
 alias sm_6_4_version = _sm_6_4
              | _GLSL_460
              | spirv_1_4
-             | _cuda_sm_9_0
+             | _cuda_sm_7_0
              | metal
              | cpp
              ;
@@ -1605,7 +1639,7 @@ alias sm_6_4 = sm_6_4_version
 alias sm_6_5_version = _sm_6_5
              | _GLSL_460
              | spirv_1_4
-             | _cuda_sm_9_0
+             | _cuda_sm_7_0
              | metal
              | cpp
              ;
@@ -1625,7 +1659,7 @@ alias sm_6_5 = sm_6_5_version
 alias sm_6_6_version = _sm_6_6
              | _GLSL_460
              | spirv_1_4
-             | _cuda_sm_9_0
+             | _cuda_sm_7_0
              | metal
              | cpp
              ;
@@ -1643,7 +1677,7 @@ alias sm_6_6 = sm_6_6_version
 alias sm_6_7_version = _sm_6_7
              | _GLSL_460
              | spirv_1_4
-             | _cuda_sm_9_0
+             | _cuda_sm_7_0
              | metal
              | cpp
              ;
@@ -1660,7 +1694,7 @@ alias sm_6_7 = sm_6_7_version
 alias sm_6_8_version = _sm_6_8
              | _GLSL_460
              | spirv_1_5
-             | _cuda_sm_9_0
+             | _cuda_sm_7_0
              | metal
              | cpp
              ;
@@ -1678,7 +1712,7 @@ alias sm_6_8 = sm_6_8_version
 alias sm_6_9_version = _sm_6_9
              | _GLSL_460
              | spirv_1_5
-             | _cuda_sm_9_0
+             | _cuda_sm_7_0
              | metal
              | cpp
              ;
@@ -2101,7 +2135,7 @@ alias shader5_sm_5_0 = GL_ARB_gpu_shader5 | sm_5_0_version;
 /// [Compound]
 alias pack_vector = GL_ARB_gpu_shader5
                   | _sm_6_6
-                  | _cuda_sm_9_0
+                  | _cuda_sm_6_0
                   | wgsl
                   | metal
                   | cpp
@@ -2118,22 +2152,23 @@ alias subgroup_basic = GL_KHR_shader_subgroup_basic
 /// Capabilities required to use GLSL-style subgroup operations 'subgroup_ballot'
 /// [Compound]
 alias subgroup_ballot = spirv_1_0 + GL_KHR_shader_subgroup_ballot
-                      | glsl + GL_KHR_shader_subgroup_ballot + shader5_sm_5_0 
-                      | _sm_6_0  + shader5_sm_5_0 
-                      | _cuda_sm_7_0 + shader5_sm_5_0
+                      | glsl + GL_KHR_shader_subgroup_ballot + shader5_sm_5_0
+                      | _sm_6_0
+                      | _cuda_sm_7_0
                       | wgsl
                       | metal
                       ;
 /// Capabilities required to use GLSL-style subgroup operations 'subgroup_ballot_activemask'
 /// [Compound]
 alias subgroup_ballot_activemask = spirv_1_0 + GL_KHR_shader_subgroup_ballot
-                      | glsl + GL_KHR_shader_subgroup_ballot 
+                      | glsl + GL_KHR_shader_subgroup_ballot
                       | _sm_6_0
                       | _cuda_sm_7_0
+                      | metal
                       ;
 /// Capabilities required to use GLSL-style subgroup operations 'subgroup_basic_ballot'
 /// [Compound]
-alias subgroup_basic_ballot = glsl + GL_KHR_shader_subgroup_basic + subgroup_ballot 
+alias subgroup_basic_ballot = glsl + GL_KHR_shader_subgroup_basic + subgroup_ballot
                             | spirv + GL_KHR_shader_subgroup_basic + subgroup_ballot
                             | hlsl + subgroup_ballot
                             | cuda + subgroup_ballot
@@ -2198,6 +2233,7 @@ alias subgroup_partitioned = _sm_6_5
 /// [Compound]
 alias subgroup_rotate = GL_KHR_shader_subgroup_rotate 
                        | metal
+                       | _cuda_sm_5_0
                        ;
 
 /// (All implemented targets) Capabilities required to use atomic operations of GLSL tier-1 float atomics
@@ -2232,6 +2268,7 @@ alias helper_lane = _sm_6_0 + fragment
 alias quad_control = _sm_6_7
                     | GL_EXT_shader_quad_control + GL_EXT_maximal_reconvergence + GL_KHR_shader_subgroup_vote
                     | metal
+                    | _cuda_sm_5_0
                     ;
 
 /// Capabilities required to enable shader breakpoints
@@ -2257,6 +2294,12 @@ alias raytracing_anyhit_closesthit = anyhit_closesthit + raytracing;
 /// Collection of capabilities for linear swept spheres.
 /// [Compound]
 alias raytracing_lss = raytracing_anyhit_closesthit | spvRayTracingLinearSweptSpheresGeometryNV;
+
+/// hit object APIs allow raygen shaders, but not the non-hit object APIs. So we have this special
+/// capdef specifically for the hitobject variant.
+/// Collection of capabilities for linear swept spheres.
+/// [Compound]
+alias raytracing_lss_ho = raytracing_lss | raygen;
 
 /// Collection of capabilities for raytracing with the shader stages of anyhit, closesthit, and intersection.
 /// [Compound]

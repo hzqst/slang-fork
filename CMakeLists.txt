@@ -72,6 +72,21 @@ auto_option(
     CUDAToolkit
     "Enable CUDA tests using CUDA found in CUDA_PATH"
 )
+# Check if SLANG_ENABLE_OPTIX was explicitly set by user before auto_option
+set(_SLANG_ENABLE_OPTIX_USER_SPECIFIED FALSE)
+get_property(
+    _SLANG_ENABLE_OPTIX_CACHE_TYPE
+    CACHE SLANG_ENABLE_OPTIX
+    PROPERTY TYPE
+)
+if(
+    DEFINED SLANG_ENABLE_OPTIX
+    AND NOT SLANG_ENABLE_OPTIX STREQUAL "AUTO"
+    AND _SLANG_ENABLE_OPTIX_CACHE_TYPE STREQUAL "BOOL"
+)
+    set(_SLANG_ENABLE_OPTIX_USER_SPECIFIED TRUE)
+endif()
+
 auto_option(
     SLANG_ENABLE_OPTIX
     OptiX
@@ -117,7 +132,7 @@ option(
 option(SLANG_ENABLE_DXIL "Enable generating DXIL with DXC" ON)
 
 option(SLANG_ENABLE_FULL_IR_VALIDATION "Enable full IR validation (SLOW!)")
-option(SLANG_ENABLE_IR_BREAK_ALLOC, "Enable _debugUID on IR allocation")
+option(SLANG_ENABLE_IR_BREAK_ALLOC "Enable _debugUID on IR allocation")
 option(SLANG_ENABLE_ASAN "Enable ASAN (address sanitizer)")
 
 option(SLANG_ENABLE_PREBUILT_BINARIES "Enable using prebuilt binaries" ON)
@@ -133,12 +148,12 @@ option(
 )
 option(
     SLANG_ENABLE_TESTS
-    "Enable test targets, some tests may require SLANG_ENABLE_GFX, SLANG_ENABLE_SLANGD or SLANG_ENABLE_SLANGRT"
+    "Enable test targets, some tests may require SLANG_ENABLE_SLANG_RHI, SLANG_ENABLE_SLANGD or SLANG_ENABLE_SLANGRT"
     ON
 )
 option(
     SLANG_ENABLE_EXAMPLES
-    "Enable example targets, requires SLANG_ENABLE_GFX"
+    "Enable example targets, requires SLANG_ENABLE_SLANG_RHI"
     ON
 )
 option(SLANG_ENABLE_REPLAYER "Enable slang-replay tool" ON)
@@ -166,6 +181,27 @@ advanced_option(
     "Build using system unordered dense"
     OFF
 )
+advanced_option(
+    SLANG_USE_SYSTEM_SPIRV_TOOLS
+    "Build using system SPIR-V tools library"
+    OFF
+)
+advanced_option(
+    SLANG_USE_SYSTEM_GLSLANG
+    "Build using system glslang library"
+    OFF
+)
+if(WIN32)
+    set(SLANG_ENABLE_SPIRV_TOOLS_MIMALLOC_DEFAULT ON)
+else()
+    set(SLANG_ENABLE_SPIRV_TOOLS_MIMALLOC_DEFAULT OFF)
+endif()
+
+advanced_option(
+    SLANG_ENABLE_SPIRV_TOOLS_MIMALLOC
+    "Enable mimalloc for SPIRV-Tools to improve compilation performance"
+    ${SLANG_ENABLE_SPIRV_TOOLS_MIMALLOC_DEFAULT}
+)
 
 option(
     SLANG_SPIRV_HEADERS_INCLUDE_DIR
@@ -174,6 +210,12 @@ option(
 mark_as_advanced(SLANG_SPIRV_HEADERS_INCLUDE_DIR)
 
 # Options for user defined paths for external modules.
+#
+# Note that these paths point to a directory containing an subdirectory of the
+# dependency name, rather than to the dependency directory itself, for example
+# SLANG_OVERRIDE_LZ4_PATH points to a directory containing a directory called
+# `lz4` containing the lz4 source.
+#
 advanced_option(
     SLANG_OVERRIDE_LZ4_PATH
     "Build using user defined path for LZ4"
@@ -234,6 +276,11 @@ advanced_option(
     "Build using user defined path for lua"
     OFF
 )
+advanced_option(
+    SLANG_OVERRIDE_MIMALLOC_PATH
+    "Build using user defined path for mimalloc"
+    OFF
+)
 
 advanced_option(
     SLANG_EXCLUDE_DAWN
@@ -246,22 +293,6 @@ advanced_option(
     "Optionally exclude slang-tint from the build"
     OFF
 )
-
-if(${SLANG_USE_SYSTEM_LZ4})
-    add_compile_definitions(SLANG_USE_SYSTEM_LZ4_HEADER)
-endif()
-
-if(${SLANG_USE_SYSTEM_SPIRV_HEADERS})
-    add_compile_definitions(SLANG_USE_SYSTEM_SPIRV_HEADER)
-endif()
-
-if(${SLANG_USE_SYSTEM_UNORDERED_DENSE})
-    add_compile_definitions(SLANG_USE_SYSTEM_UNORDERED_DENSE_HEADER)
-endif()
-
-if(SLANG_OVERRIDE_SPIRV_HEADERS_PATH)
-    add_compile_definitions(SLANG_USE_SYSTEM_SPIRV_HEADER)
-endif()
 
 enum_option(
     SLANG_LIB_TYPE
@@ -281,7 +312,7 @@ option(
     ON
 )
 
-option(SLANG_ENABLE_RELEASE_LTO "Enable LTO for Release builds" ON)
+option(SLANG_ENABLE_RELEASE_LTO "Enable LTO for Release builds" OFF)
 
 option(
     SLANG_ENABLE_SPLIT_DEBUG_INFO
@@ -372,18 +403,26 @@ if(NOT SLANG_EMBED_CORE_MODULE AND NOT SLANG_EMBED_CORE_MODULE_SOURCE)
 endif()
 
 if(SLANG_ENABLE_OPTIX AND NOT SLANG_ENABLE_CUDA)
-    message(
-        SEND_ERROR
-        "SLANG_ENABLE_OPTIX is not supported without SLANG_ENABLE_CUDA"
-    )
+    if(_SLANG_ENABLE_OPTIX_USER_SPECIFIED)
+        message(
+            SEND_ERROR
+            "SLANG_ENABLE_OPTIX is not supported without SLANG_ENABLE_CUDA"
+        )
+    else()
+        message(
+            STATUS
+            "OptiX is not supported without CUDA. Automatically disabling SLANG_ENABLE_OPTIX."
+        )
+        set(SLANG_ENABLE_OPTIX OFF)
+    endif()
 endif()
 
 if(SLANG_ENABLE_NVAPI AND NOT CMAKE_SYSTEM_NAME MATCHES "Windows")
     message(SEND_ERROR "SLANG_ENABLE_NVAPI is only supported on Windows")
 endif()
 
-if(SLANG_ENABLE_TESTS AND NOT SLANG_ENABLE_GFX)
-    message(SEND_ERROR "SLANG_ENABLE_TESTS requires SLANG_ENABLE_GFX")
+if(SLANG_ENABLE_TESTS AND NOT SLANG_ENABLE_SLANG_RHI)
+    message(SEND_ERROR "SLANG_ENABLE_TESTS requires SLANG_ENABLE_SLANG_RHI")
 endif()
 
 #
@@ -395,6 +434,33 @@ find_package(Threads REQUIRED)
 
 if(${SLANG_USE_SYSTEM_UNORDERED_DENSE})
     find_package(unordered_dense CONFIG QUIET)
+endif()
+
+if(SLANG_USE_SYSTEM_SPIRV_HEADERS)
+    find_package(SPIRV-Headers REQUIRED)
+endif()
+
+if(${SLANG_USE_SYSTEM_MINIZ})
+    find_package(miniz REQUIRED)
+    add_library(miniz ALIAS miniz::miniz)
+endif()
+
+if(${SLANG_USE_SYSTEM_LZ4})
+    find_package(lz4 REQUIRED)
+    add_library(lz4_static ALIAS LZ4::lz4)
+endif()
+
+if(${SLANG_USE_SYSTEM_VULKAN_HEADERS})
+    find_package(VulkanHeaders REQUIRED)
+endif()
+
+if(${SLANG_USE_SYSTEM_SPIRV_TOOLS})
+    find_package(SPIRV-Tools REQUIRED)
+endif()
+
+if(${SLANG_USE_SYSTEM_GLSLANG})
+    find_package(glslang REQUIRED)
+    add_library(glslang ALIAS glslang::glslang)
 endif()
 
 add_subdirectory(external)
@@ -475,26 +541,31 @@ write_basic_package_version_file(
     COMPATIBILITY SameMajorVersion
 )
 
-# Write SlangConfig.cmake which should allow find_pacakage(SLANG) to work correctly
+# Write SlangConfig.cmake which should allow find_package(SLANG) to work correctly
 # SlangConfig.cmake will define slang::slang target that can be linked with using
 # target_link_libraries. It will also define SLANG_EXECUTABLE export variable that
 # should point to slangc if SLANG_ENABLE_SLANGC is ON.
+if(WIN32)
+    set(SLANG_CMAKE_CONFIG_DIR cmake)
+else()
+    set(SLANG_CMAKE_CONFIG_DIR ${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME})
+endif()
 configure_package_config_file(
     "${PROJECT_SOURCE_DIR}/cmake/SlangConfig.cmake.in"
     "${PROJECT_BINARY_DIR}/${PROJECT_NAME}Config.cmake"
-    INSTALL_DESTINATION cmake
+    INSTALL_DESTINATION ${SLANG_CMAKE_CONFIG_DIR}
 )
 
 # Conditionally handle the case for Emscripten where slang does not create
 # linkable targets. In this case do not export the targets. Otherwise, just
-# export the slang targets. 
+# export the slang targets.
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Emscripten")
     if(NOT ${SLANG_LIB_TYPE} STREQUAL "STATIC")
         install(
             EXPORT SlangTargets
             FILE ${PROJECT_NAME}Targets.cmake
             NAMESPACE ${PROJECT_NAME}::
-            DESTINATION cmake
+            DESTINATION ${SLANG_CMAKE_CONFIG_DIR}
         )
     endif()
 endif()
@@ -503,5 +574,5 @@ install(
     FILES
         "${PROJECT_BINARY_DIR}/${PROJECT_NAME}Config.cmake"
         "${PROJECT_BINARY_DIR}/${PROJECT_NAME}ConfigVersion.cmake"
-    DESTINATION cmake
+    DESTINATION ${SLANG_CMAKE_CONFIG_DIR}
 )

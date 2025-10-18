@@ -3,6 +3,7 @@
 
 #include "slang-ir-entry-point-pass.h"
 #include "slang-ir-insts.h"
+#include "slang-ir-util.h"
 #include "slang-ir.h"
 #include "slang-mangle.h"
 
@@ -101,43 +102,76 @@ namespace Slang
 // whether a parameter represents a varying input rather than
 // a uniform parameter.
 
-
-// In order to determine whether a parameter is varying based on its
-// layout, we need to know which resource kinds represent varying
-// shader parameters.
+// Setup some flags that will be used below to check for varying
+// resource kinds. Ordinary varying input/output + Ray-tracing shader
+// input/output kinds will be considered varying.
 //
-bool isVaryingResourceKind(LayoutResourceKind kind)
+// Note: The set of cases that are considered
+// varying here would need to be extended if we
+// add more fine-grained resource kinds (e.g.,
+// if we ever add an explicit resource kind
+// for geometry shader output streams).
+static const LayoutResourceKindFlags flags =
+    LayoutResourceKindFlag::make(LayoutResourceKind::VaryingInput) |
+    LayoutResourceKindFlag::make(LayoutResourceKind::VaryingOutput) |
+    LayoutResourceKindFlag::make(LayoutResourceKind::CallablePayload) |
+    LayoutResourceKindFlag::make(LayoutResourceKind::HitAttributes) |
+    LayoutResourceKindFlag::make(LayoutResourceKind::RayPayload);
+
+bool isVaryingParameter(IRTypeLayout* typeLayout)
 {
-    switch (kind)
-    {
-    default:
+    if (!typeLayout)
         return false;
 
-        // Note: The set of cases that are considered
-        // varying here would need to be extended if we
-        // add more fine-grained resource kinds (e.g.,
-        // if we ever add an explicit resource kind
-        // for geometry shader output streams).
-        //
-        // Ordinary varying input/output:
-    case LayoutResourceKind::VaryingInput:
-    case LayoutResourceKind::VaryingOutput:
-        //
-        // Ray-tracing shader input/output:
-    case LayoutResourceKind::CallablePayload:
-    case LayoutResourceKind::HitAttributes:
-    case LayoutResourceKind::RayPayload:
+    // If we're looking at a struct type layout, we need to check each of the fields.
+    // If any of the fields is not a varying resource kind, then we consider the
+    // whole struct to be uniform (and thus not varying).
+    if (auto structTypeLayout = as<IRStructTypeLayout>(typeLayout))
+    {
+        for (auto fieldAttr : structTypeLayout->getFieldLayoutAttrs())
+        {
+            if (!isVaryingParameter(fieldAttr->getLayout()))
+                return false;
+        }
+        // If we made it here, all struct fields were varying.
+        return true;
+    }
+
+    // If we're looking at a parameter group type layout, we should return false
+    // as these should always be associtated with LayoutResourceKind::Uniform.
+    else if (as<IRParameterGroupTypeLayout>(typeLayout))
+    {
+        return false;
+    }
+
+    // If we're looking at an array type layout, we need to check the element's
+    // type layout.
+    else if (auto arrayTypeLayout = as<IRArrayTypeLayout>(typeLayout))
+    {
+        return isVaryingParameter(arrayTypeLayout->getElementTypeLayout());
+    }
+
+    // If we didn't match a type layout above, try finding a kind from sizeAttrs.
+    else
+    {
+        // If all the element type's sizeAttrs have a varying kind matching our
+        // flags above, return true.
+        for (auto sizeAttr : typeLayout->getSizeAttrs())
+        {
+            if ((flags & LayoutResourceKindFlag::make(sizeAttr->getResourceKind())) == 0)
+                return false;
+        }
         return true;
     }
 }
 
-bool isVaryingParameter(IRTypeLayout* typeLayout)
+bool isVaryingParameter(IRVarLayout* varLayout)
 {
     // If *any* of the resources consumed by the parameter type
     // is *not* a varying resource kind, then we consider the
     // whole parameter to be uniform (and thus not varying).
     //
-    // Note that this means that an empty type will always
+    // Note that this means that some empty types will always
     // be considered varying, even if it had been explicitly
     // marked `uniform`.
     //
@@ -149,19 +183,25 @@ bool isVaryingParameter(IRTypeLayout* typeLayout)
     // reosurce kind, so they show up as empty. Simply
     // adding `LayoutResourceKind`s for system-value inputs
     // and outputs would allow for simpler logic here.
-    //
-    for (auto sizeAttr : typeLayout->getSizeAttrs())
-    {
-        if (!isVaryingResourceKind(sizeAttr->getResourceKind()))
-            return false;
-    }
-    return true;
-}
 
-bool isVaryingParameter(IRVarLayout* varLayout)
-{
     if (!varLayout)
         return false;
+
+    // System-value parameters currently do not have kinds setup.
+    // As a WAR, if we see a system-value attr just assume varying
+    // for now.
+    if (varLayout->findAttr<IRSystemValueSemanticAttr>())
+    {
+        return true;
+    }
+
+    if (varLayout->usesResourceFromKinds(flags))
+    {
+        return true;
+    }
+
+    // If the base cases above failed, we need to check if we are dealing with
+    // an IRVarLayout that could have "nested" IRVarLayouts, such as an IRStructTypeLayout.
     return isVaryingParameter(varLayout->getTypeLayout());
 }
 
@@ -179,7 +219,6 @@ struct CollectEntryPointUniformParams : PerEntryPointPass
     IRStructType* paramStructType = nullptr;
     IRParam* collectedParam = nullptr;
 
-    IRVarLayout* entryPointParamsLayout = nullptr;
     bool needConstantBuffer = false;
 
     void processEntryPointImpl(EntryPointInfo const& info) SLANG_OVERRIDE
@@ -222,7 +261,7 @@ struct CollectEntryPointUniformParams : PerEntryPointPass
         // If we are in the latter case we will need to make sure to allocate
         // an explicit IR constant buffer for that wrapper,
         //
-        entryPointParamsLayout = entryPointLayout->getParamsLayout();
+        auto entryPointParamsLayout = entryPointLayout->getParamsLayout();
         needConstantBuffer =
             as<IRParameterGroupTypeLayout>(entryPointParamsLayout->getTypeLayout()) != nullptr;
 
@@ -236,12 +275,15 @@ struct CollectEntryPointUniformParams : PerEntryPointPass
         if (m_options.alwaysCreateCollectedParam)
             ensureCollectedParamAndTypeHaveBeenCreated();
 
+        IRStructTypeLayout::Builder structLayoutBuilder(builder);
+
         // We will be removing any uniform parameters we run into, so we
         // need to iterate the parameter list carefully to deal with
         // us modifying it along the way.
         //
         IRParam* nextParam = nullptr;
         UInt paramCounter = 0;
+        HashSet<LayoutResourceKind> resourceKinds;
         for (IRParam* param = entryPointFunc->getFirstParam(); param; param = nextParam)
         {
             nextParam = param->getNextParam();
@@ -266,6 +308,9 @@ struct CollectEntryPointUniformParams : PerEntryPointPass
             //
             if (isVaryingParameter(paramLayout))
                 continue;
+
+            for (auto offsetAttr : paramLayout->getOffsetAttrs())
+                resourceKinds.add(offsetAttr->getResourceKind());
 
             // At this point we know that `param` is not a varying shader parameter,
             // so that we want to turn it into an equivalent global shader parameter.
@@ -299,6 +344,9 @@ struct CollectEntryPointUniformParams : PerEntryPointPass
             //
             auto paramFieldKey = cast<IRStructKey>(
                 entryPointParamsStructLayout->getFieldLayoutAttrs()[paramIndex]->getFieldKey());
+            structLayoutBuilder.addField(
+                paramFieldKey,
+                entryPointParamsStructLayout->getFieldLayout(paramIndex));
 
             auto paramField = builder->createStructField(paramStructType, paramFieldKey, paramType);
             SLANG_UNUSED(paramField);
@@ -374,9 +422,110 @@ struct CollectEntryPointUniformParams : PerEntryPointPass
             param->removeAndDeallocate();
         }
 
+        // Filter unrelated offset attrs from entryPointParamsLayout.
+        // Since entryPointParamsLayout will now be used as the varLayout for the newly created
+        // struct typed uniform parameter, and we need to ensure it only contains uniform parameter
+        // offsets, not varying ones, so isVaryingParameter() can correctly identify the newly
+        // created struct param as a uniform param.
+
         if (collectedParam)
         {
             collectedParam->insertBefore(entryPointFunc->getFirstBlock()->getFirstChild());
+            IRTypeLayout* entryPointUniformsTypeLayout = nullptr;
+
+            if (auto originalParamGroupLayout =
+                    as<IRParameterGroupTypeLayout>(entryPointParamsLayout->getTypeLayout()))
+            {
+                // If the original entry point layout is a parameter gorup layout,
+                // the new layout of the newly created `entryPointParams` param should also
+                // be a parameter group layout, but with unrelated offsets (e.g. varying offsets)
+                // stripped off.
+                // We will now create this layout inst.
+                //
+                // Register any existing ResourceKinds on the container var layout as "related".
+                for (auto offsetAttr :
+                     originalParamGroupLayout->getContainerVarLayout()->getOffsetAttrs())
+                {
+                    resourceKinds.add(offsetAttr->getResourceKind());
+                }
+                // Create the struct layout for parameters that goes into the `EntryPointParams`
+                // struct.
+                auto entryPointUniformStructTypeLayout = structLayoutBuilder.build();
+                auto originalElementVarLayout = originalParamGroupLayout->getElementVarLayout();
+                IRVarLayout::Builder elementVarLayoutBuilder(
+                    builder,
+                    entryPointUniformStructTypeLayout);
+                elementVarLayoutBuilder.cloneEverythingButOffsetsFrom(originalElementVarLayout);
+                // We assume everything in "pendingLayout" will appear as uniform parameters at
+                // the moment. This means that we can just copy them as is through the pass right
+                // now.
+                elementVarLayoutBuilder.setPendingVarLayout(
+                    originalElementVarLayout->getPendingVarLayout());
+
+                IRParameterGroupTypeLayout::Builder paramGroupTypeLayoutBuilder(builder);
+                // Filter offsets for the `elementVarLayout` part of the new parameter group layout.
+                for (auto resKind : resourceKinds)
+                {
+                    auto originalOffset = originalElementVarLayout->findOffsetAttr(resKind);
+                    if (!originalOffset)
+                        continue;
+                    auto resInfo = elementVarLayoutBuilder.findOrAddResourceInfo(resKind);
+                    resInfo->offset = originalOffset->getOffset();
+                    resInfo->space = originalOffset->getSpace();
+                }
+                for (auto resKind : resourceKinds)
+                {
+                    if (auto sizeAttr = originalParamGroupLayout->findSizeAttr(resKind))
+                        paramGroupTypeLayoutBuilder.addResourceUsage(sizeAttr);
+                }
+                auto newElementVarLayout = elementVarLayoutBuilder.build();
+                // The "containerVarLayout" part should remain unchanged from the original layout.
+                // Because this is where we store the offset of the default constant buffer itself.
+                paramGroupTypeLayoutBuilder.setContainerVarLayout(
+                    originalParamGroupLayout->getContainerVarLayout());
+                paramGroupTypeLayoutBuilder.setPendingTypeLayout(
+                    originalParamGroupLayout->getPendingDataTypeLayout());
+                // The "elementVarLayout" part should be the new one we just created.
+                paramGroupTypeLayoutBuilder.setElementVarLayout(newElementVarLayout);
+                // The "offsetElementTypeLayout" part is just redundant convenient info that
+                // can be calculated from `entryPointUniformStructTypeLayout` and
+                // `newElementVarLayout`.
+                paramGroupTypeLayoutBuilder.setOffsetElementTypeLayout(applyOffsetToTypeLayout(
+                    builder,
+                    entryPointUniformStructTypeLayout,
+                    newElementVarLayout));
+                // Now we have the new type layout for the `EntryPointParams` parameter.
+                entryPointUniformsTypeLayout = paramGroupTypeLayoutBuilder.build();
+            }
+            else
+            {
+                // If the original entry point layout isn't a constant buffer, we will simply use
+                // the new struct type layout as the entrypoint layout.
+                entryPointUniformsTypeLayout = structLayoutBuilder.build();
+            }
+
+            // Now create the var layout for the new `entryPointParams` parameter.
+            // This can be done by simply filtering out unrelated offset attributes from the
+            // original var layout.
+            IRVarLayout::Builder varLayoutBuilder(builder, entryPointUniformsTypeLayout);
+            varLayoutBuilder.cloneEverythingButOffsetsFrom(entryPointParamsLayout);
+            List<IRVarOffsetAttr*> filteredOffsetAttrs;
+            for (auto offsetAttr : entryPointParamsLayout->getOffsetAttrs())
+            {
+                if (resourceKinds.contains(offsetAttr->getResourceKind()))
+                {
+                    filteredOffsetAttrs.add(offsetAttr);
+                }
+            }
+            for (auto offset : filteredOffsetAttrs)
+            {
+                auto resInfo = varLayoutBuilder.findOrAddResourceInfo(offset->getResourceKind());
+                resInfo->offset = offset->getOffset();
+                resInfo->space = offset->getSpace();
+            }
+            varLayoutBuilder.setPendingVarLayout(entryPointParamsLayout->getPendingVarLayout());
+            auto entryPointUniformsVarLayout = varLayoutBuilder.build();
+            builder->addLayoutDecoration(collectedParam, entryPointUniformsVarLayout);
         }
 
         fixUpFuncType(entryPointFunc);
@@ -408,6 +557,9 @@ struct CollectEntryPointUniformParams : PerEntryPointPass
             if (m_options.targetReq->getOptionSet().getBoolOption(
                     CompilerOptionName::GLSLForceScalarLayout))
                 layoutType = builder.getType(kIROp_ScalarBufferLayoutType);
+            else if (m_options.targetReq->getOptionSet().getBoolOption(
+                         CompilerOptionName::ForceCLayout))
+                layoutType = builder.getType(kIROp_CBufferLayoutType);
             else if (isKhronosTarget(m_options.targetReq))
                 layoutType = builder.getType(kIROp_Std430BufferLayoutType);
             else
@@ -424,13 +576,6 @@ struct CollectEntryPointUniformParams : PerEntryPointPass
         }
 
         collectedParam->insertBefore(m_entryPoint.func);
-
-        // No matter what, the global shader parameter should have the layout
-        // information from the entry point attached to it, so that the
-        // contained parameters will end up in the right place(s).
-        //
-        builder.addLayoutDecoration(collectedParam, entryPointParamsLayout);
-
         // We add a name hint to the global parameter so that it will
         // emit to more readable code when referenced.
         //

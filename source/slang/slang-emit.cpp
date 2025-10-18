@@ -9,6 +9,7 @@
 #include "../core/slang-performance-profiler.h"
 #include "../core/slang-type-text-util.h"
 #include "../core/slang-writer.h"
+#include "slang-check-out-of-bound-access.h"
 #include "slang-emit-c-like.h"
 #include "slang-emit-cpp.h"
 #include "slang-emit-cuda.h"
@@ -31,9 +32,11 @@
 #include "slang-ir-collect-global-uniforms.h"
 #include "slang-ir-com-interface.h"
 #include "slang-ir-composite-reg-to-mem.h"
+#include "slang-ir-cuda-immutable-load.h"
 #include "slang-ir-dce.h"
 #include "slang-ir-defer-buffer-load.h"
 #include "slang-ir-defunctionalization.h"
+#include "slang-ir-detect-uninitialized-resources.h"
 #include "slang-ir-diff-call.h"
 #include "slang-ir-dll-export.h"
 #include "slang-ir-dll-import.h"
@@ -56,8 +59,11 @@
 #include "slang-ir-layout.h"
 #include "slang-ir-legalize-array-return-type.h"
 #include "slang-ir-legalize-binary-operator.h"
+#include "slang-ir-legalize-composite-select.h"
+#include "slang-ir-legalize-empty-array.h"
 #include "slang-ir-legalize-global-values.h"
 #include "slang-ir-legalize-image-subscript.h"
+#include "slang-ir-legalize-matrix-types.h"
 #include "slang-ir-legalize-mesh-outputs.h"
 #include "slang-ir-legalize-uniform-buffer-load.h"
 #include "slang-ir-legalize-varying-params.h"
@@ -92,6 +98,7 @@
 #include "slang-ir-restructure.h"
 #include "slang-ir-sccp.h"
 #include "slang-ir-simplify-for-emit.h"
+#include "slang-ir-specialize-address-space.h"
 #include "slang-ir-specialize-arrays.h"
 #include "slang-ir-specialize-buffer-load-arg.h"
 #include "slang-ir-specialize-matrix-layout.h"
@@ -105,6 +112,7 @@
 #include "slang-ir-strip-default-construct.h"
 #include "slang-ir-strip-legalization-insts.h"
 #include "slang-ir-synthesize-active-mask.h"
+#include "slang-ir-transform-params-to-constref.h"
 #include "slang-ir-translate-global-varying-var.h"
 #include "slang-ir-undo-param-copy.h"
 #include "slang-ir-uniformity.h"
@@ -113,6 +121,7 @@
 #include "slang-ir-variable-scope-correction.h"
 #include "slang-ir-vk-invert-y.h"
 #include "slang-ir-wgsl-legalize.h"
+#include "slang-ir-wrap-cbuffer-element.h"
 #include "slang-ir-wrap-structured-buffers.h"
 #include "slang-legalize-types.h"
 #include "slang-lower-to-ir.h"
@@ -299,43 +308,6 @@ struct LinkingAndOptimizationOptions
     CLikeSourceEmitter* sourceEmitter = nullptr;
 };
 
-// To improve the performance of our backend, we will try to avoid running
-// passes related to features not used in the user code.
-// To do so, we will scan the IR module once, and determine which passes are needed
-// based on the instructions used in the IR module.
-// This will allow us to skip running passes that are not needed, without having to
-// run all the passes only to find out that no work is needed.
-// This is especially important for the performance of the backend, as some passes
-// have an initialization cost (such as building reference graphs or DOM trees) that
-// can be expensive.
-//
-struct RequiredLoweringPassSet
-{
-    bool debugInfo;
-    bool resultType;
-    bool optionalType;
-    bool enumType;
-    bool combinedTextureSamplers;
-    bool reinterpret;
-    bool generics;
-    bool bindExistential;
-    bool autodiff;
-    bool derivativePyBindWrapper;
-    bool bitcast;
-    bool existentialTypeLayout;
-    bool bindingQuery;
-    bool meshOutput;
-    bool higherOrderFunc;
-    bool globalVaryingVar;
-    bool glslSSBO;
-    bool byteAddressBuffer;
-    bool dynamicResource;
-    bool dynamicResourceHeap;
-    bool resolveVaryingInputRef;
-    bool specializeStageSwitch;
-    bool missingReturn;
-};
-
 // Scan the IR module and determine which lowering/legalization passes are needed based
 // on the instructions we see.
 //
@@ -355,6 +327,7 @@ void calcRequiredLoweringPassSet(
     case kIROp_DebugScope:
     case kIROp_DebugNoScope:
     case kIROp_DebugFunction:
+    case kIROp_DebugBuildIdentifier:
         result.debugInfo = true;
         break;
     case kIROp_ResultType:
@@ -412,7 +385,7 @@ void calcRequiredLoweringPassSet(
     case kIROp_ExtractExistentialValue:
     case kIROp_ExtractExistentialWitnessTable:
     case kIROp_WrapExistential:
-    case kIROp_LookupWitness:
+    case kIROp_LookupWitnessMethod:
         result.generics = true;
         break;
     case kIROp_Specialize:
@@ -469,6 +442,10 @@ void calcRequiredLoweringPassSet(
     case kIROp_MissingReturn:
         result.missingReturn = true;
         break;
+    case kIROp_Select:
+        if (!isScalarOrVectorType(inst->getFullType()))
+            result.nonVectorCompositeSelect = true;
+        break;
     }
     if (!result.generics || !result.existentialTypeLayout)
     {
@@ -490,7 +467,10 @@ void calcRequiredLoweringPassSet(
     }
     for (auto child : inst->getDecorationsAndChildren())
     {
-        calcRequiredLoweringPassSet(result, codeGenContext, child);
+        calcRequiredLoweringPassSet(
+            codeGenContext->getRequiredLoweringPassSet(),
+            codeGenContext,
+            child);
     }
 }
 
@@ -615,6 +595,100 @@ static void unexportNonEmbeddableIR(CodeGenTarget target, IRModule* irModule)
     }
 }
 
+// Add DenormPreserve and DenormFlushToZero decorations to all entry point functions
+static void addDenormalModeDecorations(IRModule* irModule, CodeGenContext* codeGenContext)
+{
+    auto optionSet = codeGenContext->getTargetProgram()->getOptionSet();
+
+    // Only add decorations if we have floating point denormal handling mode options set
+    auto denormalModeFp16 = optionSet.getDenormalModeFp16();
+    auto denormalModeFp32 = optionSet.getDenormalModeFp32();
+    auto denormalModeFp64 = optionSet.getDenormalModeFp64();
+
+    if (denormalModeFp16 == FloatingPointDenormalMode::Any &&
+        denormalModeFp32 == FloatingPointDenormalMode::Any &&
+        denormalModeFp64 == FloatingPointDenormalMode::Any)
+        return;
+
+    IRBuilder builder(irModule);
+
+    // Apply floating point denormal handling mode decorations to all entry point functions
+    for (auto inst : irModule->getGlobalInsts())
+    {
+        IRFunc* func = nullptr;
+
+        // Check if this is a direct function
+        if (auto directFunc = as<IRFunc>(inst))
+        {
+            func = directFunc;
+        }
+        // Check if this is a generic that contains an entry point function
+        else if (auto generic = as<IRGeneric>(inst))
+        {
+            if (auto innerFunc = as<IRFunc>(findGenericReturnVal(generic)))
+            {
+                func = innerFunc;
+            }
+        }
+
+        if (!func)
+            continue;
+
+        // Check if this is an entry point function
+        auto entryPoint = func->findDecoration<IREntryPointDecoration>();
+        if (!entryPoint)
+            continue;
+
+        // Handle FP16 denormal handling mode
+        auto width16 = builder.getIntValue(builder.getUIntType(), 16);
+        if (denormalModeFp16 == FloatingPointDenormalMode::Preserve)
+        {
+            builder.addFpDenormalPreserveDecoration(func, width16);
+        }
+        else if (denormalModeFp16 == FloatingPointDenormalMode::FlushToZero)
+        {
+            builder.addFpDenormalFlushToZeroDecoration(func, width16);
+        }
+
+        // Handle FP32 denormal handling mode
+        auto width32 = builder.getIntValue(builder.getUIntType(), 32);
+        if (denormalModeFp32 == FloatingPointDenormalMode::Preserve)
+        {
+            builder.addFpDenormalPreserveDecoration(func, width32);
+        }
+        else if (denormalModeFp32 == FloatingPointDenormalMode::FlushToZero)
+        {
+            builder.addFpDenormalFlushToZeroDecoration(func, width32);
+        }
+
+        // Handle FP64 denormal handling mode
+        auto width64 = builder.getIntValue(builder.getUIntType(), 64);
+        if (denormalModeFp64 == FloatingPointDenormalMode::Preserve)
+        {
+            builder.addFpDenormalPreserveDecoration(func, width64);
+        }
+        else if (denormalModeFp64 == FloatingPointDenormalMode::FlushToZero)
+        {
+            builder.addFpDenormalFlushToZeroDecoration(func, width64);
+        }
+    }
+}
+
+// Helper function to convert a 20 byte SHA1 to a hexadecimal string,
+// needed for the build identifier instruction.
+String getBuildIdentifierString(ComponentType* component)
+{
+    ComPtr<ISlangBlob> hashBlob;
+    component->getEntryPointHash(0, 0, hashBlob.writeRef());
+
+    const uint8_t* data = reinterpret_cast<const uint8_t*>(hashBlob->getBufferPointer());
+    size_t size = hashBlob->getBufferSize();
+    StringBuilder sb;
+    for (size_t i = 0; i < size; ++i)
+        sb << StringUtil::makeStringWithFormat("%02x", data[i]);
+    return sb.produceString();
+}
+
 Result linkAndOptimizeIR(
     CodeGenContext* codeGenContext,
     LinkingAndOptimizationOptions const& options,
@@ -643,6 +717,19 @@ Result linkAndOptimizeIR(
     auto irModule = outLinkedIR.module;
     auto irEntryPoints = outLinkedIR.entryPoints;
 
+    // For now, only emit the debug build identifier if separate debug info is enabled
+    // and only if there are targets.
+    // TODO: We will ultimately need to change this to always emit the instruction.
+    if (targetCompilerOptions.shouldEmitSeparateDebugInfo())
+    {
+        // Build identifier is a hash of the source code and compile options.
+        String buildIdentifier = getBuildIdentifierString(codeGenContext->getProgram());
+        int buildIdentifierFlags = 0;
+        IRBuilder builder(irModule);
+        builder.setInsertInto(irModule->getModuleInst());
+        builder.emitDebugBuildIdentifier(buildIdentifier.getUnownedSlice(), buildIdentifierFlags);
+    }
+
 #if 0
     dumpIRIfEnabled(codeGenContext, irModule, "LINKED");
 #endif
@@ -655,7 +742,8 @@ Result linkAndOptimizeIR(
     dumpIRIfEnabled(codeGenContext, irModule, "POST IR VALIDATION");
 
     // Scan the IR module and determine which lowering/legalization passes are needed.
-    RequiredLoweringPassSet requiredLoweringPassSet = {};
+    RequiredLoweringPassSet& requiredLoweringPassSet = codeGenContext->getRequiredLoweringPassSet();
+    requiredLoweringPassSet = {};
     calcRequiredLoweringPassSet(requiredLoweringPassSet, codeGenContext, irModule->getModuleInst());
 
     // Debug info is added by the front-end, and therefore needs to be stripped out by targets that
@@ -717,13 +805,22 @@ Result linkAndOptimizeIR(
     // can assume that all ordinary/uniform data is strictly
     // passed using constant buffers.
     //
-    collectGlobalUniformParameters(irModule, outLinkedIR.globalScopeVarLayout);
+    collectGlobalUniformParameters(irModule, outLinkedIR.globalScopeVarLayout, target);
 #if 0
     dumpIRIfEnabled(codeGenContext, irModule, "GLOBAL UNIFORMS COLLECTED");
 #endif
     validateIRModuleIfEnabled(codeGenContext, irModule);
 
     checkEntryPointDecorations(irModule, target, sink);
+
+    // Add floating point denormal handling mode decorations to entry point functions based on
+    // compiler options. This is done post-linking to ensure all entry points from linked modules
+    // are processed.
+    addDenormalModeDecorations(irModule, codeGenContext);
+#if 0
+    dumpIRIfEnabled(codeGenContext, irModule, "FP DENORMAL MODE DECORATIONS ADDED");
+#endif
+    validateIRModuleIfEnabled(codeGenContext, irModule);
 
     // Another transformation that needed to wait until we
     // had layout information on parameters is to take uniform
@@ -778,9 +875,6 @@ Result linkAndOptimizeIR(
         break;
     }
 
-    if (requiredLoweringPassSet.optionalType)
-        lowerOptionalType(irModule, sink);
-
     switch (target)
     {
     case CodeGenTarget::CUDASource:
@@ -789,20 +883,6 @@ Result linkAndOptimizeIR(
 
     default:
         removeTorchAndCUDAEntryPoints(irModule);
-        break;
-    }
-
-    switch (target)
-    {
-    case CodeGenTarget::CPPSource:
-    case CodeGenTarget::HostCPPSource:
-        {
-            lowerComInterfaces(irModule, artifactDesc.style, sink);
-            generateDllImportFuncs(codeGenContext->getTargetProgram(), irModule, sink);
-            generateDllExportFuncs(irModule, sink);
-            break;
-        }
-    default:
         break;
     }
 
@@ -937,21 +1017,16 @@ Result linkAndOptimizeIR(
         if (requiredLoweringPassSet.autodiff)
         {
             dumpIRIfEnabled(codeGenContext, irModule, "BEFORE-AUTODIFF");
-            enableIRValidationAtInsert();
-            changed |= processAutodiffCalls(targetProgram, irModule, sink);
-            disableIRValidationAtInsert();
+            {
+                auto validationScope = enableIRValidationScope();
+                changed |= processAutodiffCalls(targetProgram, irModule, sink);
+            }
             dumpIRIfEnabled(codeGenContext, irModule, "AFTER-AUTODIFF");
         }
 
         if (!changed)
             break;
     }
-
-    // Lower `Result<T,E>` types into ordinary struct types. This must happen
-    // after specialization, since otherwise incompatible copies of the lowered
-    // result structure are generated.
-    if (requiredLoweringPassSet.resultType)
-        lowerResultType(irModule, sink);
 
     // Report checkpointing information
     if (codeGenContext->shouldReportCheckpointIntermediates())
@@ -978,7 +1053,41 @@ Result linkAndOptimizeIR(
 
     finalizeSpecialization(irModule);
 
-    requiredLoweringPassSet = {};
+    // Lower `Result<T,E>` types into ordinary struct types. This must happen
+    // after specialization, since otherwise incompatible copies of the lowered
+    // result structure are generated.
+    if (requiredLoweringPassSet.resultType)
+        lowerResultType(irModule, sink);
+
+    if (requiredLoweringPassSet.optionalType)
+        lowerOptionalType(irModule, sink);
+
+    if (requiredLoweringPassSet.nonVectorCompositeSelect)
+    {
+        switch (target)
+        {
+        case CodeGenTarget::HLSL:
+            legalizeNonVectorCompositeSelect(irModule);
+            break;
+        default:
+            break;
+        }
+    }
+
+    switch (target)
+    {
+    case CodeGenTarget::CPPSource:
+    case CodeGenTarget::HostCPPSource:
+        {
+            lowerComInterfaces(irModule, artifactDesc.style, sink);
+            generateDllImportFuncs(codeGenContext->getTargetProgram(), irModule, sink);
+            generateDllExportFuncs(irModule, sink);
+            break;
+        }
+    default:
+        break;
+    }
+
     calcRequiredLoweringPassSet(requiredLoweringPassSet, codeGenContext, irModule->getModuleInst());
 
     switch (target)
@@ -998,6 +1107,8 @@ Result linkAndOptimizeIR(
         break;
     }
 
+    detectUninitializedResources(irModule, sink);
+
     if (codeGenContext->removeAvailableInDownstreamIR)
     {
         removeAvailableInDownstreamModuleDecorations(target, irModule);
@@ -1007,6 +1118,7 @@ Result linkAndOptimizeIR(
     {
         checkForRecursiveTypes(irModule, sink);
         checkForRecursiveFunctions(codeGenContext->getTargetReq(), irModule, sink);
+        checkForOutOfBoundAccess(irModule, sink);
 
         if (requiredLoweringPassSet.missingReturn)
             checkForMissingReturns(irModule, sink, target, false);
@@ -1108,11 +1220,6 @@ Result linkAndOptimizeIR(
     // Inline calls to any functions marked with [__unsafeInlineEarly] or [ForceInline].
     performForceInlining(irModule);
 
-    // Push `structuredBufferLoad` to the end of access chain to avoid loading unnecessary data.
-    if (isKhronosTarget(targetRequest) || isMetalTarget(targetRequest) ||
-        isWGPUTarget(targetRequest))
-        deferBufferLoad(irModule);
-
     // Specialization can introduce dead code that could trip
     // up downstream passes like type legalization, so we
     // will run a DCE pass to clean up after the specialization.
@@ -1158,10 +1265,42 @@ Result linkAndOptimizeIR(
         addUserTypeHintDecorations(irModule);
     }
 
+    legalizeEmptyArray(irModule, sink);
+
+    // For CUDA targets, always inline global constants to avoid dynamic initialization
+    // of __device__ variables rejected by NVRTC. This runs independently of the broader
+    // resource/existential type legalization, which remains disabled for CUDA.
+    //
+    // We also need this pass on the CPU targets in shader mode, as global
+    // constants may reference global parameters, which can't be emitted as
+    // constants.
+    if (target == CodeGenTarget::CUDASource ||
+        (isCPUTarget(targetRequest) && isKernelTarget(target)) ||
+        options.shouldLegalizeExistentialAndResourceTypes)
+    {
+        inlineGlobalConstantsForLegalization(irModule);
+    }
+
     // We don't need the legalize pass for C/C++ based types
     if (options.shouldLegalizeExistentialAndResourceTypes)
     {
-        inlineGlobalConstantsForLegalization(irModule);
+        if (isMetalTarget(targetRequest))
+        {
+            // Metal is a special target in that we want to legalize constant buffer
+            // types as if it is a bindful target, and skip legalizing parameter block
+            // types as if it is a bindless target.
+            // To achieve this, we want to ensure that all resource typed fields in parameter blocks
+            // are translated into descriptor handles first before running the resource type
+            // legalization pass for metal, so that type legalization pass won't mess around with
+            // them.
+            BufferElementTypeLoweringOptions bufferElementTypeLoweringOptions = {};
+            bufferElementTypeLoweringOptions.loweringPolicyKind =
+                BufferElementTypeLoweringPolicyKind::MetalParameterBlock;
+            lowerBufferElementTypeToStorageType(
+                targetProgram,
+                irModule,
+                bufferElementTypeLoweringOptions);
+        }
 
         // The Slang language allows interfaces to be used like
         // ordinary types (including placing them in constant
@@ -1198,6 +1337,9 @@ Result linkAndOptimizeIR(
 #endif
         validateIRModuleIfEnabled(codeGenContext, irModule);
 
+        if (!validateStructuredBufferResourceTypes(irModule, sink, targetRequest))
+            return SLANG_FAIL;
+
         // Many of our target languages and/or downstream compilers
         // don't support `struct` types that have resource-type fields.
         // In order to work around this limitation, we will rewrite the
@@ -1233,7 +1375,11 @@ Result linkAndOptimizeIR(
         legalizeEmptyTypes(targetProgram, irModule, sink);
     }
 
+    legalizeMatrixTypes(targetProgram, irModule, sink);
+    dumpIRIfEnabled(codeGenContext, irModule, "AFTER-MATRIX-LEGALIZATION");
+
     legalizeVectorTypes(irModule, sink);
+    dumpIRIfEnabled(codeGenContext, irModule, "AFTER-VECTOR-LEGALIZATION");
 
     // Once specialization and type legalization have been performed,
     // we should perform some of our basic optimization steps again,
@@ -1263,14 +1409,19 @@ Result linkAndOptimizeIR(
     // function parameters, reults, etc. is invalid.
     // We clean up the usages of resource values here.
     specializeResourceUsage(codeGenContext, irModule);
+
+    // Specialize calls to functions with values loaded from an immutable location,
+    // so that we directly load the value inside the callee, instead of loading the
+    // value outside of the callee and copy it in. This is necessary to avoid copying
+    // large values (e.g. arrays) in registers, where most of the elements are not
+    // actually used.
     specializeFuncsForBufferLoadArgs(codeGenContext, irModule);
+
+    // Push `structuredBufferLoad` to the end of access chain to avoid loading unnecessary data.
+    deferBufferLoad(codeGenContext, irModule);
 
     // We also want to specialize calls to functions that
     // takes unsized array parameters if possible.
-    // Moreover, for Khronos targets, we also want to specialize calls to functions
-    // that takes arrays/structs containing arrays as parameters with the actual
-    // global array object to avoid loading big arrays into SSA registers, which seems
-    // to cause performance issues.
     specializeArrayParameters(codeGenContext, irModule);
 
 #if 0
@@ -1283,17 +1434,17 @@ Result linkAndOptimizeIR(
     // Some information for `static_assert` is available only after the specialization.
     checkStaticAssert(irModule->getModuleInst(), sink);
 
-    // For HLSL (and fxc/dxc) only, we need to "wrap" any
-    // structured buffers defined over matrix types so
-    // that they instead use an intermediate `struct`.
-    // This is required to get those targets to respect
-    // the options for matrix layout set via `#pragma`
-    // or command-line options.
-    //
     switch (target)
     {
     case CodeGenTarget::HLSL:
         {
+            // For HLSL(fxc) only, we need to "wrap" any
+            // structured buffers defined over matrix types so
+            // that they instead use an intermediate `struct`.
+            // This is required to get those targets to respect
+            // the options for matrix layout set via `#pragma`
+            // or command-line options.
+            //
             wrapStructuredBuffersOfMatrices(irModule);
 #if 0
             dumpIRIfEnabled(codeGenContext, irModule, "STRUCTURED BUFFERS WRAPPED");
@@ -1301,7 +1452,12 @@ Result linkAndOptimizeIR(
             validateIRModuleIfEnabled(codeGenContext, irModule);
         }
         break;
-
+    case CodeGenTarget::Metal:
+    case CodeGenTarget::MetalLib:
+        // Metal does not allow `ConstantBuffer<StructuredBuffer<T>>`, so we need to create
+        // a wrapper struct for the `StructuredBuffer<T>`.
+        wrapCBufferElementsForMetal(irModule);
+        break;
     default:
         break;
     }
@@ -1590,6 +1746,7 @@ Result linkAndOptimizeIR(
         if (targetProgram->getOptionSet().getBoolOption(
                 CompilerOptionName::EnableExperimentalPasses))
             introduceExplicitGlobalContext(irModule, target);
+        transformParamsToConstRef(irModule, codeGenContext->getSink());
 #if 0
         dumpIRIfEnabled(codeGenContext, irModule, "EXPLICIT GLOBAL CONTEXT INTRODUCED");
 #endif
@@ -1600,6 +1757,12 @@ Result linkAndOptimizeIR(
         // For CUDA/OptiX like targets, add our pass to replace inout parameter copies with direct
         // pointers
         undoParameterCopy(irModule);
+        // Transform struct parameters to use ConstRef for better performance
+        if (isCPUTarget(targetRequest) || isCUDATarget(targetRequest) ||
+            isMetalTarget(targetRequest))
+        {
+            transformParamsToConstRef(irModule, codeGenContext->getSink());
+        }
 #if 0
         dumpIRIfEnabled(codeGenContext, irModule, "PARAMETER COPIES REPLACED WITH DIRECT POINTERS");
 #endif
@@ -1681,11 +1844,11 @@ Result linkAndOptimizeIR(
     if (requiredLoweringPassSet.meshOutput)
         legalizeMeshOutputTypes(irModule);
 
-    BufferElementTypeLoweringOptions bufferElementTypeLoweringOptions;
-    bufferElementTypeLoweringOptions.use16ByteArrayElementForConstantBuffer =
-        isWGPUTarget(targetRequest);
-    lowerBufferElementTypeToStorageType(targetProgram, irModule, bufferElementTypeLoweringOptions);
-    performForceInlining(irModule);
+
+    // Lower all bit_cast operations on complex types into leaf-level
+    // bit_cast on basic types.
+    if (requiredLoweringPassSet.bitcast)
+        lowerBitCast(targetProgram, irModule, sink);
 
     // Rewrite functions that return arrays to return them via `out` parameter,
     // since our target languages doesn't allow returning arrays.
@@ -1701,13 +1864,45 @@ Result linkAndOptimizeIR(
             rcpWOfPositionInput(irModule);
     }
 
-    // Lower all bit_cast operations on complex types into leaf-level
-    // bit_cast on basic types.
-    if (requiredLoweringPassSet.bitcast)
-        lowerBitCast(targetProgram, irModule, sink);
+    BufferElementTypeLoweringOptions bufferElementTypeLoweringOptions = {};
+    if (isWGPUTarget(targetRequest))
+        bufferElementTypeLoweringOptions.loweringPolicyKind =
+            BufferElementTypeLoweringPolicyKind::WGSL;
+    else if (isKhronosTarget(targetRequest))
+        bufferElementTypeLoweringOptions.loweringPolicyKind =
+            BufferElementTypeLoweringPolicyKind::KhronosTarget;
+    else
+        bufferElementTypeLoweringOptions.loweringPolicyKind =
+            BufferElementTypeLoweringPolicyKind::Default;
+    lowerBufferElementTypeToStorageType(targetProgram, irModule, bufferElementTypeLoweringOptions);
+
+    // If we are generating code for glsl or metal, perform address space propagation now.
+    // For SPIRV, we will do that during spirv legalization that happens after
+    // `linkAndOptimizeIR`.
+    if (target == CodeGenTarget::GLSL)
+    {
+        NoOpInitialAddressSpaceAssigner addrSpaceAssigner;
+        specializeAddressSpace(irModule, &addrSpaceAssigner);
+    }
+    else if (isMetalTarget(targetRequest))
+    {
+        specializeAddressSpaceForMetal(irModule);
+    }
+    else if (isWGPUTarget(targetRequest))
+    {
+        specializeAddressSpaceForWGSL(irModule);
+    }
+
+    // If we are generating code for CUDA, we should translate all immutable buffer loads to
+    // using `__ldg` intrinsic for improved performance.
+    if (isCUDATarget(targetRequest))
+    {
+        lowerImmutableBufferLoadForCUDA(targetProgram, irModule);
+    }
+
+    performForceInlining(irModule);
 
     bool emitSpirvDirectly = targetProgram->shouldEmitSPIRVDirectly();
-
     if (emitSpirvDirectly)
     {
         performIntrinsicFunctionInlining(irModule);
@@ -2101,21 +2296,286 @@ SlangResult emitSPIRVFromIR(
     const List<IRFunc*>& irEntryPoints,
     List<uint8_t>& spirvOut);
 
-SlangResult emitSPIRVForEntryPointsDirectly(
-    CodeGenContext* codeGenContext,
-    ComPtr<IArtifact>& outArtifact)
+// Helper class to assist in stepping through the SPIRV instructions.
+class SpirvInstructionHelper
 {
-    // Outside because we want to keep IR in scope whilst we are processing emits
-    LinkedIR linkedIR;
-    LinkingAndOptimizationOptions linkingAndOptimizationOptions;
-    SLANG_RETURN_ON_FAIL(
-        linkAndOptimizeIR(codeGenContext, linkingAndOptimizationOptions, linkedIR));
+public:
+    // The result id of the OpExtInstImport instruction, eg.g %2 below
+    // %2 = OpExtInstImport "NonSemantic.Shader.DebugInfo.100"
+    uint32_t m_nonSemanticDebugInfoExtSetId = 0;
 
-    auto irModule = linkedIR.module;
-    auto irEntryPoints = linkedIR.entryPoints;
+    // The index of the SPIRV words in the blob.
+    // The first 5 words are the header as defined by the SPIRV spec.
+    enum SpvWordIndex
+    {
+        SPV_INDEX_MAGIC_NUMBER,
+        SPV_INDEX_VERSION_NUMBER,
+        SPV_INDEX_GENERATOR_NUMBER,
+        SPV_INDEX_BOUND,
+        SPV_INDEX_SCHEMA,
+        SPV_INDEX_INSTRUCTION_START,
+    };
 
+    // An instruction in the SPIRV blob. This points to the first word of the instruction.
+    struct SpvInstruction
+    {
+        SpvInstruction(SpvWord* word)
+            : word(word)
+        {
+        }
+
+        uint16_t getOpCode() const { return word[0] & 0xFFFF; }
+        uint16_t getWordCountForInst() const { return (word[0] >> 16) & 0xFFFF; }
+        SpvWord getOperand(uint32_t index) const { return word[index + 1]; }
+
+        // Helper function to interpret the instruction as a string and
+        // extract the string value.
+        String getStringFromInst() const
+        {
+            String result;
+            for (uint32_t i = 1; i < getWordCountForInst(); i++)
+            {
+                SpvWord op = getOperand(i);
+                for (int b = 0; b < 4; ++b)
+                {
+                    char c = (char)((op >> (b * 8)) & 0xFF);
+                    if (c == '\0')
+                        return result;
+                    result.append(c);
+                }
+            }
+            return result;
+        }
+
+        SpvWord* word = nullptr;
+    };
+
+    SpirvInstructionHelper() {}
+
+    // Load the SPIRV instructions from the artifact into a data blob that
+    // we can read.
+    SlangResult loadBlob(ComPtr<IArtifact>& artifact)
+    {
+        m_nonSemanticDebugInfoExtSetId = 0;
+        m_words.clear();
+        m_headerWords.clear();
+
+        ComPtr<ISlangBlob> spirvBlob;
+        SlangResult res = artifact->loadBlob(ArtifactKeep::Yes, spirvBlob.writeRef());
+        if (SLANG_FAILED(res) || !spirvBlob ||
+            spirvBlob->getBufferSize() < SPV_INDEX_INSTRUCTION_START * sizeof(SpvWord))
+            return SLANG_FAIL;
+
+        // Populate the full array of SPIR-V words.
+        m_words.addRange(
+            reinterpret_cast<const SpvWord*>(spirvBlob->getBufferPointer()),
+            spirvBlob->getBufferSize() / sizeof(SpvWord));
+
+        // Populate the header words. These are the first 5 words of the SPIR-V
+        // blob and are treated differently from the rest of the instructions.
+        m_headerWords.clear();
+        m_headerWords.addRange(m_words.getBuffer(), SPV_INDEX_INSTRUCTION_START);
+
+        return SLANG_OK;
+    }
+
+    // Get the header words.
+    const List<SpvWord>& getHeaderWords() const { return m_headerWords; }
+
+    Index getWordCount() const { return m_words.getCount(); }
+
+    // Visit all SPIRV instructions (excluding header words), invoking the callback for each
+    // instruction. The callback should be a function or lambda with signature: void(const
+    // SpvInstruction&).
+    template<typename Func>
+    void visitInstructions(Func&& callback)
+    {
+        // Instructions start after the header (first 5 words)
+        constexpr size_t kHeaderWordCount =
+            static_cast<size_t>(SpvWordIndex::SPV_INDEX_INSTRUCTION_START);
+        size_t i = kHeaderWordCount;
+        while (i < (size_t)m_words.getCount())
+        {
+            SpvWord* wordPtr = m_words.getBuffer() + i;
+            SpvInstruction inst(wordPtr);
+            callback(inst);
+            uint16_t wordCount = inst.getWordCountForInst();
+            if (wordCount == 0)
+                break; // Prevent infinite loop on malformed input
+            i += wordCount;
+        }
+    }
+
+private:
+    // The full array of SPIRV words.
+    List<SpvWord> m_words;
+
+    // The header words.
+    List<SpvWord> m_headerWords;
+};
+
+// Helper function that takes an artifact populated with SPIRV instructions
+// after the spirv-opt step, and a previously created but empty
+// strippedArtifact. The artifact is unmodified, and the strippedArtifact
+// will contain all the artifact's instructions except for debug instructions.
+static SlangResult stripDbgSpirvFromArtifact(
+    ComPtr<IArtifact>& artifact,
+    ComPtr<IArtifact>& strippedArtifact)
+{
+    // Standard debug opcodes to strip out. This mimics the behavior of
+    // spirv-opt.
+    static const uint16_t debugOpCodeVals[] = {
+        SpvOpSourceContinued,
+        SpvOpSource,
+        SpvOpSourceExtension,
+        SpvOpString,
+        SpvOpName,
+        SpvOpMemberName,
+        SpvOpModuleProcessed,
+        SpvOpLine,
+        SpvOpNoLine};
+    // If the instruction is an extended instruction, then we also need
+    // to check if the instruction number is for a debug instruction as
+    // listed in slang-emit-spirv-ops-debug-info-ext.h
+    static const uint32_t debugExtInstVals[] = {
+        NonSemanticShaderDebugInfo100DebugCompilationUnit,
+        NonSemanticShaderDebugInfo100DebugTypeBasic,
+        NonSemanticShaderDebugInfo100DebugTypePointer,
+        NonSemanticShaderDebugInfo100DebugTypeQualifier,
+        NonSemanticShaderDebugInfo100DebugTypeArray,
+        NonSemanticShaderDebugInfo100DebugTypeVector,
+        NonSemanticShaderDebugInfo100DebugTypeFunction,
+        NonSemanticShaderDebugInfo100DebugTypeComposite,
+        NonSemanticShaderDebugInfo100DebugTypeMember,
+        NonSemanticShaderDebugInfo100DebugFunction,
+        NonSemanticShaderDebugInfo100DebugScope,
+        NonSemanticShaderDebugInfo100DebugNoScope,
+        NonSemanticShaderDebugInfo100DebugInlinedAt,
+        NonSemanticShaderDebugInfo100DebugLocalVariable,
+        NonSemanticShaderDebugInfo100DebugGlobalVariable,
+        NonSemanticShaderDebugInfo100DebugInlinedVariable,
+        NonSemanticShaderDebugInfo100DebugDeclare,
+        NonSemanticShaderDebugInfo100DebugValue,
+        NonSemanticShaderDebugInfo100DebugExpression,
+        NonSemanticShaderDebugInfo100DebugSource,
+        NonSemanticShaderDebugInfo100DebugFunctionDefinition,
+        NonSemanticShaderDebugInfo100DebugSourceContinued,
+        NonSemanticShaderDebugInfo100DebugLine,
+        NonSemanticShaderDebugInfo100DebugEntryPoint,
+        NonSemanticShaderDebugInfo100DebugTypeMatrix,
+    };
+
+    // Hash sets for easier lookup.
+    HashSet<uint16_t> debugOpCodes;
+    for (auto val : debugOpCodeVals)
+        debugOpCodes.add(val);
+    HashSet<uint32_t> debugExtInstNumbers;
+    for (auto val : debugExtInstVals)
+        debugExtInstNumbers.add(val);
+
+    SpirvInstructionHelper spirvInstructionHelper;
+    SLANG_RETURN_ON_FAIL(spirvInstructionHelper.loadBlob(artifact));
+
+    const auto& headerWords = spirvInstructionHelper.getHeaderWords();
+
+    List<uint8_t> spirvWordsList;
+    if (auto totalWordCapacity = headerWords.getCount() + spirvInstructionHelper.getWordCount())
+    {
+        const Index byteCapacity = totalWordCapacity * sizeof(SpvWord);
+        spirvWordsList.reserve(byteCapacity);
+    }
+
+    spirvWordsList.addRange(
+        reinterpret_cast<const uint8_t*>(headerWords.getBuffer()),
+        headerWords.getCount() * sizeof(SpvWord));
+
+    // First find the DebugBuildIdentifier instruction, and keep track of which string
+    // it refers to, this string needs to be kept in the final output.
+    SpvWord debugStringId = 0;
+    spirvInstructionHelper.visitInstructions(
+        [&](const SpirvInstructionHelper::SpvInstruction& inst)
+        {
+            if (inst.getOpCode() == SpvOpExtInst)
+            {
+                if (inst.getOperand(3) == NonSemanticShaderDebugInfo100DebugBuildIdentifier)
+                {
+                    debugStringId = inst.getOperand(4);
+                    return;
+                }
+            }
+            else if (inst.getOpCode() == SpvOpExtInstImport)
+            {
+                // looking for result id of "OpExtInstImport "NonSemantic.Shader.DebugInfo.100"
+                auto importName = inst.getStringFromInst();
+                if (importName == "NonSemantic.Shader.DebugInfo.100")
+                {
+                    spirvInstructionHelper.m_nonSemanticDebugInfoExtSetId = inst.getOperand(0);
+                }
+            }
+        });
+
+    // Iterate over the instructions from the artifact and add them to the list
+    // only if they are not debug instructions. We also get the debug build hash
+    // to use as the filename for the debug spirv file.
+    String debugBuildHash;
+    spirvInstructionHelper.visitInstructions(
+        [&](const SpirvInstructionHelper::SpvInstruction& inst)
+        {
+            if (debugOpCodes.contains(inst.getOpCode()))
+            {
+                // We can only strip strings if they are not being used by the
+                // DebugBuildIdentifier instruction.
+                bool foundDebugString = false;
+                if (inst.getOpCode() == SpvOpString && inst.getOperand(0) == debugStringId)
+                {
+                    debugBuildHash = inst.getStringFromInst();
+                    foundDebugString = true;
+                }
+                if (!foundDebugString)
+                {
+                    return;
+                }
+            }
+            // Also check if the instruction is an extended instruction containing DebugInfo.
+            if (inst.getOpCode() == SpvOpExtInst)
+            {
+                // Ignore this if the instruction contains DebugInfo and is from the debug import
+                if (debugExtInstNumbers.contains(inst.getOperand(3)) &&
+                    inst.getOperand(2) == spirvInstructionHelper.m_nonSemanticDebugInfoExtSetId)
+                {
+                    return;
+                }
+            }
+            // Otherwise this is a non-debug instruction and should be included.
+            spirvWordsList.addRange(
+                reinterpret_cast<const uint8_t*>(inst.word),
+                inst.getWordCountForInst() * sizeof(SpvWord));
+        });
+
+    // Create the stripped artifact using the above created instruction list.
+    strippedArtifact->addRepresentationUnknown(ListBlob::moveCreate(spirvWordsList));
+
+    // Set the name of the artifact to the debug build hash so it can be used
+    // as the filename for the debug spirv file.
+    artifact->setName(debugBuildHash.getBuffer());
+
+    return SLANG_OK;
+}
+
+// Helper function to create an artifact from IR used internally by
+// emitSPIRVForEntryPointsDirectly.
+static SlangResult createArtifactFromIR(
+    CodeGenContext* codeGenContext,
+    IRModule* irModule,
+    List<IRFunc*> irEntryPoints,
+    ComPtr<IArtifact>& artifact,
+    ComPtr<IArtifact>& dbgArtifact)
+{
     List<uint8_t> spirv, outSpirv;
     emitSPIRVFromIR(codeGenContext, irModule, irEntryPoints, spirv);
+
+    auto targetRequest = codeGenContext->getTargetReq();
+    auto targetCompilerOptions = targetRequest->getOptionSet();
 
 #if 0
     String optErr;
@@ -2125,8 +2585,7 @@ SlangResult emitSPIRVForEntryPointsDirectly(
         spirv = _Move(outSpirv);
     }
 #endif
-    auto artifact =
-        ArtifactUtil::createArtifactForCompileTarget(asExternal(codeGenContext->getTargetFormat()));
+
     artifact->addRepresentationUnknown(ListBlob::moveCreate(spirv));
 
     IDownstreamCompiler* compiler = codeGenContext->getSession()->getOrLoadDownstreamCompiler(
@@ -2249,7 +2708,19 @@ SlangResult emitSPIRVForEntryPointsDirectly(
         auto downstreamStartTime = std::chrono::high_resolution_clock::now();
         if (SLANG_SUCCEEDED(compiler->compile(downstreamOptions, optimizedArtifact.writeRef())))
         {
-            artifact = _Move(optimizedArtifact);
+            // Check if we need to output a separate SPIRV file containing debug info. If so
+            // then strip all debug instructions from the artifact. The dbgArtifact will still
+            // contain all instructions.
+            if (targetCompilerOptions.shouldEmitSeparateDebugInfo())
+            {
+                auto strippedArtifact = ArtifactUtil::createArtifactForCompileTarget(SLANG_SPIRV);
+                SLANG_RETURN_ON_FAIL(
+                    stripDbgSpirvFromArtifact(optimizedArtifact, strippedArtifact));
+                artifact = _Move(strippedArtifact);
+                dbgArtifact = _Move(optimizedArtifact);
+            }
+            else
+                artifact = _Move(optimizedArtifact);
         }
         auto downstreamElapsedTime =
             (std::chrono::high_resolution_clock::now() - downstreamStartTime).count() * 0.000000001;
@@ -2259,7 +2730,48 @@ SlangResult emitSPIRVForEntryPointsDirectly(
             passthroughDownstreamDiagnostics(codeGenContext->getSink(), compiler, artifact));
     }
 
+    return SLANG_OK;
+}
+
+SlangResult emitSPIRVForEntryPointsDirectly(
+    CodeGenContext* codeGenContext,
+    ComPtr<IArtifact>& outArtifact)
+{
+    // Outside because we want to keep IR in scope whilst we are processing emits
+    LinkedIR linkedIR;
+    LinkingAndOptimizationOptions linkingAndOptimizationOptions;
+    SLANG_RETURN_ON_FAIL(
+        linkAndOptimizeIR(codeGenContext, linkingAndOptimizationOptions, linkedIR));
+
+    auto irModule = linkedIR.module;
+    auto irEntryPoints = linkedIR.entryPoints;
+
+    dumpIRIfEnabled(codeGenContext, irModule, "POST LINK AND OPTIMIZE");
+
+    auto targetRequest = codeGenContext->getTargetReq();
+    auto targetCompilerOptions = targetRequest->getOptionSet();
+
+    // Create the artifact containing the main SPIRV data, and the debug SPIRV
+    // data if requested by the command line arg -separate-debug-info.
+    Slang::ComPtr<Slang::IArtifact> dbgArtifact;
+    auto artifact =
+        ArtifactUtil::createArtifactForCompileTarget(asExternal(codeGenContext->getTargetFormat()));
+    SLANG_RETURN_ON_FAIL(
+        createArtifactFromIR(codeGenContext, irModule, irEntryPoints, artifact, dbgArtifact));
     ArtifactUtil::addAssociated(artifact, linkedIR.metadata);
+
+    // Associate the debug artifact with the main artifact.
+    // EndToEndCompileRequest::generateOutput will read this data
+    // and produce a .dbg.spv file for this child artifact.
+    if (targetCompilerOptions.shouldEmitSeparateDebugInfo())
+    {
+        artifact->addAssociated(dbgArtifact);
+
+        auto artifactPostEmitMetadata =
+            static_cast<ArtifactPostEmitMetadata*>(linkedIR.metadata.get());
+        artifactPostEmitMetadata->addRef();
+        artifactPostEmitMetadata->m_debugBuildIdentifier = dbgArtifact->getName();
+    }
 
     outArtifact.swap(artifact);
 

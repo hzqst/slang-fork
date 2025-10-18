@@ -2,6 +2,7 @@
 #include "slang-ir.h"
 
 #include "../core/slang-basic.h"
+#include "../core/slang-platform.h"
 #include "../core/slang-writer.h"
 #include "slang-ir-dominators.h"
 #include "slang-ir-insts.h"
@@ -93,63 +94,6 @@ IRInst* cloneGlobalValueWithLinkage(
     IRSpecContext* context,
     IRInst* originalVal,
     IRLinkageDecoration* originalLinkage);
-
-struct IROpMapEntry
-{
-    IROp op;
-    IROpInfo info;
-};
-
-// TODO: We should ideally be speeding up the name->inst
-// mapping by using a dictionary, or even by pre-computing
-// a hash table to be stored as a `static const` array.
-//
-// NOTE! That this array is now constructed in such a way that looking up
-// an entry from an op is fast, by keeping blocks of main, and pseudo ops in same order
-// as the ops themselves. Care must be taken to keep this constraint.
-static const IROpMapEntry kIROps[] = {
-
-// Main ops in order
-#define INST(ID, MNEMONIC, ARG_COUNT, FLAGS) \
-    {kIROp_##ID,                             \
-     {                                       \
-         #MNEMONIC,                          \
-         ARG_COUNT,                          \
-         FLAGS,                              \
-     }},
-#include "slang-ir-inst-defs.h"
-
-    // Invalid op sentinel value comes after all the valid ones
-    {kIROp_Invalid, {"invalid", 0, 0}},
-};
-
-IROpInfo getIROpInfo(IROp opIn)
-{
-    const int op = opIn & kIROpMask_OpMask;
-    if (op < kIROpCount)
-    {
-        // It's a main op
-        const auto& entry = kIROps[op];
-        SLANG_ASSERT(entry.op == op);
-        return entry.info;
-    }
-
-    // Don't know what this is
-    SLANG_ASSERT(!"Invalid op");
-    SLANG_ASSERT(kIROps[kIROpCount].op == kIROp_Invalid);
-    return kIROps[kIROpCount].info;
-}
-
-IROp findIROp(const UnownedStringSlice& name)
-{
-    for (auto ee : kIROps)
-    {
-        if (name == ee.info.name)
-            return ee.op;
-    }
-
-    return IROp(kIROp_Invalid);
-}
 
 
 //
@@ -442,6 +386,20 @@ IRType* tryGetPointedToType(IRBuilder* builder, IRType* type)
     return nullptr;
 }
 
+IRType* tryGetPointedToOrBufferElementType(IRBuilder* builder, IRType* type)
+{
+    if (auto rateQualType = as<IRRateQualifiedType>(type))
+    {
+        type = rateQualType->getValueType();
+    }
+    auto resultType = tryGetPointedToType(builder, type);
+    if (resultType)
+        return resultType;
+    if (auto structuredBufferType = as<IRHLSLStructuredBufferTypeBase>(type))
+        return structuredBufferType->getElementType();
+    return nullptr;
+}
+
 
 // IRBlock
 
@@ -584,15 +542,15 @@ static IRBlock::SuccessorList getSuccessors(IRInst* terminator)
     case kIROp_GenericAsm:
         break;
 
-    case kIROp_unconditionalBranch:
-    case kIROp_loop:
+    case kIROp_UnconditionalBranch:
+    case kIROp_Loop:
         // unconditonalBranch <block>
         begin = operands + 0;
         end = begin + 1;
         break;
 
-    case kIROp_conditionalBranch:
-    case kIROp_ifElse:
+    case kIROp_ConditionalBranch:
+    case kIROp_IfElse:
         // conditionalBranch <condition> <trueBlock> <falseBlock>
         begin = operands + 1;
         end = begin + 2;
@@ -759,10 +717,10 @@ UInt IRUnconditionalBranch::getArgCount()
 {
     switch (getOp())
     {
-    case kIROp_unconditionalBranch:
+    case kIROp_UnconditionalBranch:
         return getOperandCount() - 1;
 
-    case kIROp_loop:
+    case kIROp_Loop:
         return getOperandCount() - 3;
 
     default:
@@ -775,10 +733,10 @@ IRUse* IRUnconditionalBranch::getArgs()
 {
     switch (getOp())
     {
-    case kIROp_unconditionalBranch:
+    case kIROp_UnconditionalBranch:
         return getOperands() + 1;
 
-    case kIROp_loop:
+    case kIROp_Loop:
         return getOperands() + 3;
 
     default:
@@ -791,10 +749,10 @@ void IRUnconditionalBranch::removeArgument(UInt index)
 {
     switch (getOp())
     {
-    case kIROp_unconditionalBranch:
+    case kIROp_UnconditionalBranch:
         removeOperand(1 + index);
         break;
-    case kIROp_loop:
+    case kIROp_Loop:
         removeOperand(3 + index);
         break;
     default:
@@ -857,6 +815,37 @@ IRType* IRFunc::getParamType(UInt index)
     return getDataType()->getParamType(index);
 }
 
+void fixUpDebugFuncType(IRFunc* func)
+{
+    SLANG_ASSERT(func);
+
+    if (auto debugFuncDecor = func->findDecoration<IRDebugFuncDecoration>())
+    {
+        auto funcType = func->getDataType();
+        auto oldDebugFunc = cast<IRDebugFunction>(debugFuncDecor->getDebugFunc());
+
+        // If the existing debug func type is already the same, there's no need
+        // to do anything.
+        if (isTypeEqual(funcType, as<IRType>(oldDebugFunc->getDebugType())))
+            return;
+
+        auto irModule = func->getModule();
+        SLANG_ASSERT(irModule);
+
+        IRBuilder builder(irModule);
+        builder.setInsertInto(irModule->getModuleInst());
+
+        auto newDebugFunc = builder.emitDebugFunction(
+            oldDebugFunc->getName(),
+            oldDebugFunc->getLine(),
+            oldDebugFunc->getCol(),
+            oldDebugFunc->getFile(),
+            funcType);
+        debugFuncDecor->removeAndDeallocate();
+        builder.addDecoration(funcType, kIROp_DebugFuncDecoration, newDebugFunc);
+    }
+}
+
 void fixUpFuncType(IRFunc* func, IRType* resultType)
 {
     SLANG_ASSERT(func);
@@ -892,10 +881,10 @@ bool isTerminatorInst(IROp op)
         return false;
 
     case kIROp_Return:
-    case kIROp_unconditionalBranch:
-    case kIROp_conditionalBranch:
-    case kIROp_loop:
-    case kIROp_ifElse:
+    case kIROp_UnconditionalBranch:
+    case kIROp_ConditionalBranch:
+    case kIROp_Loop:
+    case kIROp_IfElse:
     case kIROp_Switch:
     case kIROp_Unreachable:
     case kIROp_MissingReturn:
@@ -1795,7 +1784,21 @@ void IRBuilder::_maybeSetSourceLoc(IRInst* inst)
 }
 
 #if SLANG_ENABLE_IR_BREAK_ALLOC
-SLANG_API uint32_t _slangIRAllocBreak = 0xFFFFFFFF;
+uint32_t _slangIRAllocBreak = 0xFFFFFFFF;
+bool _slangIRPrintStackAtBreak = false;
+static bool _slangIRAllocBreakFirst = true;
+static uint32_t _slangInstBeingCloned = 0xFFFFFFFF;
+
+void _debugSetInstBeingCloned(uint32_t uid)
+{
+    _slangInstBeingCloned = uid;
+}
+
+void _debugResetInstBeingCloned()
+{
+    _slangInstBeingCloned = 0xFFFFFFFF;
+}
+
 uint32_t& _debugGetIRAllocCounter()
 {
     static uint32_t counter = 0;
@@ -1803,11 +1806,31 @@ uint32_t& _debugGetIRAllocCounter()
 }
 uint32_t _debugGetAndIncreaseInstCounter()
 {
+    if (_slangIRAllocBreakFirst)
+    {
+        // You can set a breakpoint here to break on the first allocation
+        _slangIRAllocBreakFirst = false;
+    }
+
     if (_slangIRAllocBreak != 0xFFFFFFFF && _debugGetIRAllocCounter() == _slangIRAllocBreak)
     {
 #if _WIN32 && defined(_MSC_VER)
         __debugbreak();
 #endif
+        if (_slangIRPrintStackAtBreak)
+        {
+            fprintf(stdout, "BEGIN IR Trace\nInstruction #%u created at:\n", _slangIRAllocBreak);
+            PlatformUtil::backtrace();
+            if (_slangInstBeingCloned != 0xFFFFFFFF)
+            {
+                fprintf(
+                    stdout,
+                    "Inst #%u is a clone of Inst #%u.\n",
+                    _slangIRAllocBreak,
+                    _slangInstBeingCloned);
+            }
+            fprintf(stdout, "END IR Trace\n");
+        }
     }
     return _debugGetIRAllocCounter()++;
 }
@@ -2899,7 +2922,7 @@ IRTypePack* IRBuilder::getTypePack(UInt count, IRType* const* types)
     return (IRTypePack*)getType(kIROp_TypePack, count, (IRInst* const*)types);
 }
 
-IRExpandType* IRBuilder::getExpandTypeOrVal(
+IRExpandTypeOrVal* IRBuilder::getExpandTypeOrVal(
     IRType* type,
     IRInst* pattern,
     ArrayView<IRInst*> capture)
@@ -2907,7 +2930,7 @@ IRExpandType* IRBuilder::getExpandTypeOrVal(
     ShortList<IRInst*> args;
     args.add(pattern);
     args.addRange(capture);
-    return (IRExpandType*)emitIntrinsicInst(
+    return (IRExpandTypeOrVal*)emitIntrinsicInst(
         type,
         kIROp_ExpandTypeOrVal,
         args.getCount(),
@@ -2945,24 +2968,26 @@ IRPtrType* IRBuilder::getPtrType(IRType* valueType)
     return (IRPtrType*)getPtrType(kIROp_PtrType, valueType);
 }
 
-IROutType* IRBuilder::getOutType(IRType* valueType)
+IROutParamType* IRBuilder::getOutParamType(IRType* valueType)
 {
-    return (IROutType*)getPtrType(kIROp_OutType, valueType);
+    return (IROutParamType*)getPtrType(kIROp_OutParamType, valueType);
 }
 
-IRInOutType* IRBuilder::getInOutType(IRType* valueType)
+IRBorrowInOutParamType* IRBuilder::getBorrowInOutParamType(IRType* valueType)
 {
-    return (IRInOutType*)getPtrType(kIROp_InOutType, valueType);
+    return (IRBorrowInOutParamType*)getPtrType(kIROp_BorrowInOutParamType, valueType);
 }
 
-IRRefType* IRBuilder::getRefType(IRType* valueType, AddressSpace addrSpace)
+IRRefParamType* IRBuilder::getRefParamType(IRType* valueType, AddressSpace addrSpace)
 {
-    return (IRRefType*)getPtrType(kIROp_RefType, valueType, addrSpace);
+    return (IRRefParamType*)
+        getPtrType(kIROp_RefParamType, valueType, AccessQualifier::ReadWrite, addrSpace);
 }
 
-IRConstRefType* IRBuilder::getConstRefType(IRType* valueType)
+IRBorrowInParamType* IRBuilder::getBorrowInParamType(IRType* valueType, AddressSpace addrSpace)
 {
-    return (IRConstRefType*)getPtrType(kIROp_ConstRefType, valueType);
+    return (IRBorrowInParamType*)
+        getPtrType(kIROp_BorrowInParamType, valueType, AccessQualifier::Read, addrSpace);
 }
 
 IRSPIRVLiteralType* IRBuilder::getSPIRVLiteralType(IRType* type)
@@ -2982,23 +3007,35 @@ IRPtrTypeBase* IRBuilder::getPtrTypeWithAddressSpace(
     IRPtrTypeBase* ptrWithAddrSpace)
 {
     if (ptrWithAddrSpace->hasAddressSpace())
-        return (IRPtrTypeBase*)
-            getPtrType(ptrWithAddrSpace->getOp(), valueType, ptrWithAddrSpace->getAddressSpace());
+        return (IRPtrTypeBase*)getPtrType(
+            ptrWithAddrSpace->getOp(),
+            valueType,
+            ptrWithAddrSpace->getAccessQualifier(),
+            ptrWithAddrSpace->getAddressSpace());
     return (IRPtrTypeBase*)getPtrType(ptrWithAddrSpace->getOp(), valueType);
 }
 
-IRPtrType* IRBuilder::getPtrType(IROp op, IRType* valueType, AddressSpace addressSpace)
+IRPtrType* IRBuilder::getPtrType(
+    IROp op,
+    IRType* valueType,
+    AccessQualifier accessQualifier,
+    AddressSpace addressSpace)
 {
     return (IRPtrType*)getPtrType(
         op,
         valueType,
+        getIntValue(getUInt64Type(), static_cast<IRIntegerValue>(accessQualifier)),
         getIntValue(getUInt64Type(), static_cast<IRIntegerValue>(addressSpace)));
 }
 
-IRPtrType* IRBuilder::getPtrType(IROp op, IRType* valueType, IRInst* addressSpace)
+IRPtrType* IRBuilder::getPtrType(
+    IROp op,
+    IRType* valueType,
+    IRInst* accessQualifier,
+    IRInst* addressSpace)
 {
-    IRInst* operands[] = {valueType, addressSpace};
-    return (IRPtrType*)getType(op, addressSpace ? 2 : 1, operands);
+    IRInst* operands[] = {valueType, accessQualifier, addressSpace};
+    return (IRPtrType*)getType(op, addressSpace ? 3 : 1, operands);
 }
 
 IRTextureTypeBase* IRBuilder::getTextureType(
@@ -3347,13 +3384,18 @@ IRInst* IRBuilder::emitGetValueFromBoundInterface(IRType* type, IRInst* boundInt
     return inst;
 }
 
-
-IRUndefined* IRBuilder::emitUndefined(IRType* type)
+IRLoadFromUninitializedMemory* IRBuilder::emitLoadFromUninitializedMemory(IRType* type)
 {
-    auto inst = createInst<IRUndefined>(this, kIROp_undefined, type);
-
+    auto inst =
+        createInst<IRLoadFromUninitializedMemory>(this, kIROp_LoadFromUninitializedMemory, type);
     addInst(inst);
+    return inst;
+}
 
+IRPoison* IRBuilder::emitPoison(IRType* type)
+{
+    auto inst = createInst<IRPoison>(this, kIROp_Poison, type);
+    addInst(inst);
     return inst;
 }
 
@@ -3388,10 +3430,28 @@ IRInst* IRBuilder::emitOutImplicitCast(IRInst* type, IRInst* value)
 {
     return emitIntrinsicInst((IRType*)type, kIROp_OutImplicitCast, 1, &value);
 }
-IRInst* IRBuilder::emitDebugSource(UnownedStringSlice fileName, UnownedStringSlice source)
+IRInst* IRBuilder::emitSymbolAlias(IRInst* aliasedSymbol)
 {
-    IRInst* args[] = {getStringValue(fileName), getStringValue(source)};
-    return emitIntrinsicInst(getVoidType(), kIROp_DebugSource, 2, args);
+    return emitIntrinsicInst(aliasedSymbol->getFullType(), kIROp_SymbolAlias, 1, &aliasedSymbol);
+}
+
+IRInst* IRBuilder::emitDebugSource(
+    UnownedStringSlice fileName,
+    UnownedStringSlice source,
+    bool isIncludedFile)
+{
+    IRInst* args[] = {
+        getStringValue(fileName),
+        getStringValue(source),
+        getBoolValue(isIncludedFile)};
+    return emitIntrinsicInst(getVoidType(), kIROp_DebugSource, 3, args);
+}
+IRInst* IRBuilder::emitDebugBuildIdentifier(
+    UnownedStringSlice buildIdentifier,
+    IRIntegerValue flags)
+{
+    IRInst* args[] = {getStringValue(buildIdentifier), getIntValue(getUIntType(), flags)};
+    return emitIntrinsicInst(getVoidType(), kIROp_DebugBuildIdentifier, 2, args);
 }
 IRInst* IRBuilder::emitDebugLine(
     IRInst* source,
@@ -3511,6 +3571,14 @@ IRLiveRangeEnd* IRBuilder::emitLiveRangeEnd(IRInst* referenced)
 IRInst* IRBuilder::emitExtractExistentialValue(IRType* type, IRInst* existentialValue)
 {
     auto inst = createInst<IRInst>(this, kIROp_ExtractExistentialValue, type, 1, &existentialValue);
+    addInst(inst);
+    return inst;
+}
+
+IRInst* IRBuilder::emitIsNullExistential(IRInst* existentialValue)
+{
+    auto inst =
+        createInst<IRInst>(this, kIROp_IsNullExistential, getBoolType(), 1, &existentialValue);
     addInst(inst);
     return inst;
 }
@@ -3821,7 +3889,7 @@ IRInst* IRBuilder::emitLookupInterfaceMethodInst(
 
     IRInst* args[] = {witnessTableVal, interfaceMethodVal};
 
-    return createIntrinsicInst(type, kIROp_LookupWitness, 2, args);
+    return createIntrinsicInst(type, kIROp_LookupWitnessMethod, 2, args);
 }
 
 IRInst* IRBuilder::emitGetSequentialIDInst(IRInst* rttiObj)
@@ -3999,11 +4067,11 @@ IRInst* IRBuilder::emitDefaultConstruct(IRType* type, bool fallback)
     case kIROp_StringType:
         return getStringValue(UnownedStringSlice());
     case kIROp_PtrType:
-    case kIROp_InOutType:
-    case kIROp_OutType:
+    case kIROp_BorrowInOutParamType:
+    case kIROp_OutParamType:
     case kIROp_RawPointerType:
-    case kIROp_RefType:
-    case kIROp_ConstRefType:
+    case kIROp_RefParamType:
+    case kIROp_BorrowInParamType:
     case kIROp_ComPtrType:
     case kIROp_NativePtrType:
     case kIROp_NativeStringType:
@@ -4141,7 +4209,10 @@ static TypeCastStyle _getTypeStyleId(IRType* type)
     {
         return _getTypeStyleId(matrixType->getElementType());
     }
+    // Try to simplify style if we can, otherwise just handle it unsimplified
     auto style = getTypeStyle(type->getOp());
+    if (style == kIROp_Invalid)
+        style = type->getOp();
     switch (style)
     {
     case kIROp_IntType:
@@ -4153,11 +4224,11 @@ static TypeCastStyle _getTypeStyleId(IRType* type)
     case kIROp_BoolType:
         return TypeCastStyle::Bool;
     case kIROp_PtrType:
-    case kIROp_InOutType:
-    case kIROp_OutType:
+    case kIROp_BorrowInOutParamType:
+    case kIROp_OutParamType:
     case kIROp_RawPointerType:
-    case kIROp_RefType:
-    case kIROp_ConstRefType:
+    case kIROp_RefParamType:
+    case kIROp_BorrowInParamType:
         return TypeCastStyle::Ptr;
     case kIROp_EnumType:
         return TypeCastStyle::Enum;
@@ -4425,7 +4496,7 @@ IRInst* IRBuilder::emitMakeString(IRInst* nativeStr)
 
 IRInst* IRBuilder::emitGetNativeString(IRInst* str)
 {
-    return emitIntrinsicInst(getNativeStringType(), kIROp_getNativeStr, 1, &str);
+    return emitIntrinsicInst(getNativeStringType(), kIROp_GetNativeStr, 1, &str);
 }
 
 IRInst* IRBuilder::emitGetElement(IRType* type, IRInst* arrayLikeType, IRIntegerValue element)
@@ -4736,7 +4807,7 @@ RefPtr<IRModule> IRModule::create(Session* session)
 {
     RefPtr<IRModule> module = new IRModule(session);
 
-    auto moduleInst = module->_allocateInst<IRModuleInst>(kIROp_Module, 0);
+    auto moduleInst = module->_allocateInst<IRModuleInst>(kIROp_ModuleInst, 0);
 
     module->m_moduleInst = moduleInst;
     moduleInst->module = module;
@@ -4821,7 +4892,7 @@ IRGlobalVar* IRBuilder::createGlobalVar(IRType* valueType)
 
 IRGlobalVar* IRBuilder::createGlobalVar(IRType* valueType, AddressSpace addressSpace)
 {
-    auto ptrType = getPtrType(kIROp_PtrType, valueType, addressSpace);
+    auto ptrType = getPtrType(valueType, addressSpace);
     IRGlobalVar* globalVar = createInst<IRGlobalVar>(this, kIROp_GlobalVar, ptrType);
     _maybeSetSourceLoc(globalVar);
     addGlobalValue(this, globalVar);
@@ -5078,7 +5149,7 @@ IRVar* IRBuilder::emitVar(IRType* type)
 
 IRVar* IRBuilder::emitVar(IRType* type, AddressSpace addressSpace)
 {
-    auto allocatedType = getPtrType(kIROp_PtrType, type, addressSpace);
+    auto allocatedType = getPtrType(type, addressSpace);
     auto inst = createInst<IRVar>(this, kIROp_Var, allocatedType);
     addInst(inst);
     return inst;
@@ -5146,6 +5217,22 @@ IRInst* IRBuilder::emitLoad(IRType* type, IRInst* ptr, IRInst* align)
     return inst;
 }
 
+IRInst* IRBuilder::emitLoad(IRType* type, IRInst* ptr, ArrayView<IRInst*> attributes)
+{
+    ShortList<IRInst*> params;
+    params.add(ptr);
+    params.addRange(attributes);
+    auto inst = createInst<IRLoad>(
+        this,
+        kIROp_Load,
+        type,
+        params.getCount(),
+        params.getArrayView().getBuffer());
+
+    addInst(inst);
+    return inst;
+}
+
 IRInst* IRBuilder::emitLoad(IRInst* ptr)
 {
     // Note: a `load` operation does not consider the rate
@@ -5194,6 +5281,21 @@ IRInst* IRBuilder::emitStore(IRInst* dstPtr, IRInst* srcVal, IRInst* align)
         dstPtr,
         srcVal,
         getAttr(kIROp_AlignedAttr, align));
+
+    addInst(inst);
+    return inst;
+}
+
+IRInst* IRBuilder::emitStore(IRInst* dstPtr, IRInst* srcVal, IRInst* align, IRInst* memoryScope)
+{
+    auto inst = createInst<IRStore>(
+        this,
+        kIROp_Store,
+        nullptr,
+        dstPtr,
+        srcVal,
+        getAttr(kIROp_AlignedAttr, align),
+        getAttr(kIROp_MemoryScopeAttr, memoryScope));
 
     addInst(inst);
     return inst;
@@ -5293,6 +5395,7 @@ IRType* maybePropagateAddressSpace(IRBuilder* builder, IRInst* basePtr, IRType* 
                 type = builder->getPtrType(
                     resultPtrType->getOp(),
                     resultPtrType->getValueType(),
+                    basePtrType->getAccessQualifier(),
                     basePtrType->getAddressSpace());
             }
         }
@@ -5303,10 +5406,12 @@ IRType* maybePropagateAddressSpace(IRBuilder* builder, IRInst* basePtr, IRType* 
 IRInst* IRBuilder::emitFieldAddress(IRInst* basePtr, IRInst* fieldKey)
 {
     AddressSpace addrSpace = AddressSpace::Generic;
+    AccessQualifier accessQualifier = AccessQualifier::ReadWrite;
     IRInst* valueType = nullptr;
     auto basePtrType = unwrapAttributedType(basePtr->getDataType());
     if (auto ptrType = as<IRPtrTypeBase>(basePtrType))
     {
+        accessQualifier = ptrType->getAccessQualifier();
         addrSpace = ptrType->getAddressSpace();
         valueType = ptrType->getValueType();
     }
@@ -5329,7 +5434,7 @@ IRInst* IRBuilder::emitFieldAddress(IRInst* basePtr, IRInst* fieldKey)
         }
     }
     SLANG_RELEASE_ASSERT(resultType);
-    return emitFieldAddress(getPtrType(kIROp_PtrType, resultType, addrSpace), basePtr, fieldKey);
+    return emitFieldAddress(getPtrType(resultType, accessQualifier, addrSpace), basePtr, fieldKey);
 }
 
 IRInst* IRBuilder::emitFieldAddress(IRType* type, IRInst* base, IRInst* field)
@@ -5433,10 +5538,12 @@ IRInst* IRBuilder::emitElementAddress(IRInst* basePtr, IRIntegerValue index)
 IRInst* IRBuilder::emitElementAddress(IRInst* basePtr, IRInst* index)
 {
     AddressSpace addrSpace = AddressSpace::Generic;
+    AccessQualifier accessQualifier = AccessQualifier::ReadWrite;
     IRInst* valueType = nullptr;
     auto basePtrType = unwrapAttributedType(basePtr->getDataType());
     if (auto ptrType = as<IRPtrTypeBase>(basePtrType))
     {
+        accessQualifier = ptrType->getAccessQualifier();
         addrSpace = ptrType->getAddressSpace();
         valueType = ptrType->getValueType();
     }
@@ -5446,46 +5553,26 @@ IRInst* IRBuilder::emitElementAddress(IRInst* basePtr, IRInst* index)
     }
     IRType* type = nullptr;
     valueType = unwrapAttributedType(valueType);
-    if (auto arrayType = as<IRArrayTypeBase>(valueType))
-    {
-        type = arrayType->getElementType();
-    }
-    else if (auto vectorType = as<IRVectorType>(valueType))
-    {
-        type = vectorType->getElementType();
-    }
-    else if (auto coopVecType = as<IRCoopVectorType>(valueType))
-    {
-        type = coopVecType->getElementType();
-    }
-    else if (auto matrixType = as<IRMatrixType>(valueType))
-    {
-        type = getVectorType(matrixType->getElementType(), matrixType->getColumnCount());
-    }
-    else if (auto coopMatType = as<IRCoopMatrixType>(valueType))
-    {
-        type = coopMatType->getElementType();
-    }
-    else if (const auto basicType = as<IRBasicType>(valueType))
+    if (as<IRBasicType>(valueType))
     {
         // HLSL support things like float.x, in which case we just return the base pointer.
         return basePtr;
     }
-    else if (const auto tupleType = as<IRTupleType>(valueType))
+    type = getElementType(*this, (IRType*)valueType);
+    if (!type)
     {
-        SLANG_ASSERT(as<IRIntLit>(index));
-        type = (IRType*)tupleType->getOperand(getIntVal(index));
-    }
-    else if (auto hlslInputPatchType = as<IRHLSLInputPatchType>(valueType))
-    {
-        type = hlslInputPatchType->getElementType();
+        if (const auto tupleType = as<IRTupleType>(valueType))
+        {
+            SLANG_ASSERT(as<IRIntLit>(index));
+            type = (IRType*)tupleType->getOperand(getIntVal(index));
+        }
     }
 
     SLANG_RELEASE_ASSERT(type);
     auto inst = createInst<IRGetElementPtr>(
         this,
         kIROp_GetElementPtr,
-        getPtrType(kIROp_PtrType, type, addrSpace),
+        getPtrType(type, accessQualifier, addrSpace),
         basePtr,
         index);
 
@@ -5576,7 +5663,7 @@ IRInst* IRBuilder::emitGetOffsetPtr(IRInst* base, IRInst* offset)
 
 IRInst* IRBuilder::emitGetAddress(IRType* type, IRInst* value)
 {
-    auto inst = createInst<IRGetAddress>(this, kIROp_GetAddr, type, value);
+    auto inst = createInst<IRGetAddress>(this, kIROp_GetAddress, type, value);
 
     addInst(inst);
     return inst;
@@ -5590,7 +5677,7 @@ IRInst* IRBuilder::emitSwizzle(
 {
     auto inst = createInstWithTrailingArgs<IRSwizzle>(
         this,
-        kIROp_swizzle,
+        kIROp_Swizzle,
         type,
         base,
         elementCount,
@@ -5613,6 +5700,20 @@ IRInst* IRBuilder::addNumThreadsDecoration(IRInst* inst, IRInst* x, IRInst* y, I
     IRInst* operands[3] = {x, y, z};
 
     return addDecoration(inst, kIROp_NumThreadsDecoration, operands, 3);
+}
+
+IRInst* IRBuilder::addFpDenormalPreserveDecoration(IRInst* inst, IRInst* width)
+{
+    IRInst* operands[1] = {width};
+
+    return addDecoration(inst, kIROp_FpDenormalPreserveDecoration, operands, 1);
+}
+
+IRInst* IRBuilder::addFpDenormalFlushToZeroDecoration(IRInst* inst, IRInst* width)
+{
+    IRInst* operands[1] = {width};
+
+    return addDecoration(inst, kIROp_FpDenormalFlushToZeroDecoration, operands, 1);
 }
 
 IRInst* IRBuilder::addWaveSizeDecoration(IRInst* inst, IRInst* numLanes)
@@ -5696,7 +5797,7 @@ IRInst* IRBuilder::emitSwizzleSet(
 
     auto inst = createInstWithTrailingArgs<IRSwizzleSet>(
         this,
-        kIROp_swizzleSet,
+        kIROp_SwizzleSet,
         type,
         fixedArgCount,
         fixedArgs,
@@ -5852,7 +5953,7 @@ IRInst* IRBuilder::emitMissingReturn()
 
 IRInst* IRBuilder::emitDiscard()
 {
-    auto inst = createInst<IRDiscard>(this, kIROp_discard, nullptr);
+    auto inst = createInst<IRDiscard>(this, kIROp_Discard, nullptr);
     addInst(inst);
     return inst;
 }
@@ -5874,7 +5975,7 @@ IRInst* IRBuilder::emitLoopExitValue(IRInst* value)
 
 IRInst* IRBuilder::emitBranch(IRBlock* pBlock)
 {
-    auto inst = createInst<IRUnconditionalBranch>(this, kIROp_unconditionalBranch, nullptr, pBlock);
+    auto inst = createInst<IRUnconditionalBranch>(this, kIROp_UnconditionalBranch, nullptr, pBlock);
     addInst(inst);
     return inst;
 }
@@ -5887,7 +5988,7 @@ IRInst* IRBuilder::emitBranch(IRBlock* block, Int argCount, IRInst* const* args)
         argList.add(args[i]);
     auto inst = createInst<IRUnconditionalBranch>(
         this,
-        kIROp_unconditionalBranch,
+        kIROp_UnconditionalBranch,
         nullptr,
         argList.getCount(),
         argList.getBuffer());
@@ -5910,7 +6011,7 @@ IRInst* IRBuilder::emitLoop(IRBlock* target, IRBlock* breakBlock, IRBlock* conti
     IRInst* args[] = {target, breakBlock, continueBlock};
     UInt argCount = sizeof(args) / sizeof(args[0]);
 
-    auto inst = createInst<IRLoop>(this, kIROp_loop, nullptr, argCount, args);
+    auto inst = createInst<IRLoop>(this, kIROp_Loop, nullptr, argCount, args);
     addInst(inst);
     return inst;
 }
@@ -5932,7 +6033,7 @@ IRInst* IRBuilder::emitLoop(
         argList.add(args[ii]);
 
     auto inst =
-        createInst<IRLoop>(this, kIROp_loop, nullptr, argList.getCount(), argList.getBuffer());
+        createInst<IRLoop>(this, kIROp_Loop, nullptr, argList.getCount(), argList.getBuffer());
     addInst(inst);
     return inst;
 }
@@ -5943,7 +6044,7 @@ IRInst* IRBuilder::emitBranch(IRInst* val, IRBlock* trueBlock, IRBlock* falseBlo
     UInt argCount = sizeof(args) / sizeof(args[0]);
 
     auto inst =
-        createInst<IRConditionalBranch>(this, kIROp_conditionalBranch, nullptr, argCount, args);
+        createInst<IRConditionalBranch>(this, kIROp_ConditionalBranch, nullptr, argCount, args);
     addInst(inst);
     return inst;
 }
@@ -5957,7 +6058,7 @@ IRIfElse* IRBuilder::emitIfElse(
     IRInst* args[] = {val, trueBlock, falseBlock, afterBlock};
     UInt argCount = sizeof(args) / sizeof(args[0]);
 
-    auto inst = createInst<IRIfElse>(this, kIROp_ifElse, nullptr, argCount, args);
+    auto inst = createInst<IRIfElse>(this, kIROp_IfElse, nullptr, argCount, args);
     addInst(inst);
     return inst;
 }
@@ -5971,14 +6072,14 @@ IRInst* IRBuilder::emitIfElseWithBlocks(
     outTrueBlock = createBlock();
     outAfterBlock = createBlock();
     outFalseBlock = createBlock();
+
     auto f = getFunc();
-    SLANG_ASSERT(f);
-    if (f)
-    {
-        f->addBlock(outTrueBlock);
-        f->addBlock(outAfterBlock);
-        f->addBlock(outFalseBlock);
-    }
+
+    SLANG_ASSERT(f && "Expected function");
+    f->addBlock(outTrueBlock);
+    f->addBlock(outAfterBlock);
+    f->addBlock(outFalseBlock);
+
     auto result = emitIfElse(val, outTrueBlock, outFalseBlock, outAfterBlock);
     setInsertInto(outTrueBlock);
     return result;
@@ -6129,6 +6230,22 @@ IRInst* IRBuilder::emitCastIntToPtr(IRType* ptrType, IRInst* val)
     auto inst = createInst<IRInst>(this, kIROp_CastIntToPtr, ptrType, val);
     addInst(inst);
     return inst;
+}
+
+IRInst* IRBuilder::emitCastStorageToLogical(IRType* type, IRInst* val, IRInst* bufferType)
+{
+    if (type == val->getDataType())
+        return val;
+    IRInst* args[] = {val, bufferType};
+    return (IRCastStorageToLogical*)emitIntrinsicInst(type, kIROp_CastStorageToLogical, 2, args);
+}
+
+IRInst* IRBuilder::emitCastStorageToLogicalDeref(IRType* type, IRInst* val, IRInst* bufferType)
+{
+    IRInst* args[] = {val, bufferType};
+    if (type == tryGetPointedToType(this, val->getDataType()))
+        return emitLoad(type, val);
+    return emitIntrinsicInst(type, kIROp_CastStorageToLogicalDeref, 2, args);
 }
 
 IRGlobalConstant* IRBuilder::emitGlobalConstant(IRType* type)
@@ -6579,6 +6696,7 @@ IRInst* IRBuilder::emitGenericAsm(UnownedStringSlice asmText)
 IRInst* IRBuilder::emitRWStructuredBufferGetElementPtr(IRInst* structuredBuffer, IRInst* index)
 {
     const auto sbt = cast<IRHLSLStructuredBufferTypeBase>(structuredBuffer->getDataType());
+    SLANG_ASSERT(sbt);
     const auto t = getPtrType(sbt->getElementType());
     IRInst* const operands[2] = {structuredBuffer, index};
     const auto i = createInst<IRRWStructuredBufferGetElementPtr>(
@@ -7622,7 +7740,7 @@ void dumpIR(
     context.options = options;
     context.sourceManager = sourceManager;
 
-    if (globalVal->getOp() == kIROp_Module)
+    if (globalVal->getOp() == kIROp_ModuleInst)
         dumpIRModule(&context, globalVal->getModule());
     else
         dumpInst(&context, globalVal);
@@ -7783,7 +7901,7 @@ static bool _isTypeOperandEqual(IRInst* a, IRInst* b)
         return static_cast<IRConstant*>(a)->isValueEqual(static_cast<IRConstant*>(b)) &&
                isTypeEqual(a->getFullType(), b->getFullType());
     }
-    if (IRSpecialize::isaImpl(opA) || opA == kIROp_LookupWitness)
+    if (IRSpecialize::isaImpl(opA) || opA == kIROp_LookupWitnessMethod)
     {
         return _areTypeOperandsEqual(a, b);
     }
@@ -8099,11 +8217,16 @@ static void _maybeHoistOperand(IRUse* use)
                 continue;
 
             // We allow out-of-order uses in global scope.
-            if (operand->getParent() && operand->getParent()->getOp() == kIROp_Module)
+            if (operand->getParent() && operand->getParent()->getOp() == kIROp_ModuleInst)
                 continue;
 
             // If the operand is defined after user, move it to before user.
-            if (_isInstDefinedAfter(operand, user))
+            // There is exception that the use of an inst can be defined before the inst,
+            // e.g. generic parameter can be defined before its data type in some cases.
+            // And moving the datatype of a generic parameter before the parameter will result
+            // in incorrect IR layout, because we require that generic parameters are laid
+            // consecutively at first block of a generic.
+            if (_isInstDefinedAfter(operand, user) && !canRelaxInstOrderRule(operand, user))
             {
                 operand->insertBefore(user);
                 for (UInt i = 0; i < operand->getOperandCount(); i++)
@@ -8460,9 +8583,6 @@ void IRInst::removeAndDeallocate()
     }
     removeArguments();
     removeFromParent();
-
-    // Run destructor to be sure...
-    this->~IRInst();
 }
 
 void IRInst::removeAndDeallocateAllDecorationsAndChildren()
@@ -8487,7 +8607,7 @@ void IRInst::transferDecorationsTo(IRInst* target)
 bool IRInst::mightHaveSideEffects(SideEffectAnalysisOptions options)
 {
     // TODO: We should drive this based on flags specified
-    // in `ir-inst-defs.h` isntead of hard-coding things here,
+    // in `ir-inst-defs.yaml` isntead of hard-coding things here,
     // but this is good enough for now if we are conservative:
 
     if (as<IRType>(this))
@@ -8566,13 +8686,16 @@ bool IRInst::mightHaveSideEffects(SideEffectAnalysisOptions options)
     case kIROp_LiveRangeStart:
     case kIROp_LiveRangeEnd:
 
+        // Undefined values are treated as having no side effects.
+    case kIROp_LoadFromUninitializedMemory:
+    case kIROp_Poison:
+
     case kIROp_Nop:
-    case kIROp_undefined:
     case kIROp_DefaultConstruct:
     case kIROp_Specialize:
-    case kIROp_LookupWitness:
+    case kIROp_LookupWitnessMethod:
     case kIROp_GetSequentialID:
-    case kIROp_GetAddr:
+    case kIROp_GetAddress:
     case kIROp_GetValueFromBoundInterface:
     case kIROp_MakeUInt64:
     case kIROp_MakeCoopVector:
@@ -8586,7 +8709,7 @@ bool IRInst::mightHaveSideEffects(SideEffectAnalysisOptions options)
     case kIROp_MakeArrayFromElement:
     case kIROp_MakeStruct:
     case kIROp_MakeString:
-    case kIROp_getNativeStr:
+    case kIROp_GetNativeStr:
     case kIROp_MakeResultError:
     case kIROp_MakeResultValue:
     case kIROp_GetResultError:
@@ -8621,8 +8744,8 @@ bool IRInst::mightHaveSideEffects(SideEffectAnalysisOptions options)
     case kIROp_UpdateElement:
     case kIROp_MeshOutputRef:
     case kIROp_MakeVectorFromScalar:
-    case kIROp_swizzle:
-    case kIROp_swizzleSet: // Doesn't actually "set" anything - just returns the resulting
+    case kIROp_Swizzle:
+    case kIROp_SwizzleSet: // Doesn't actually "set" anything - just returns the resulting
                            // vector
     case kIROp_Add:
     case kIROp_Sub:
@@ -8648,6 +8771,7 @@ bool IRInst::mightHaveSideEffects(SideEffectAnalysisOptions options)
     case kIROp_ExtractExistentialType:
     case kIROp_ExtractExistentialValue:
     case kIROp_ExtractExistentialWitnessTable:
+    case kIROp_IsNullExistential:
     case kIROp_WrapExistential:
     case kIROp_BuiltinCast:
     case kIROp_BitCast:
@@ -8663,7 +8787,10 @@ bool IRInst::mightHaveSideEffects(SideEffectAnalysisOptions options)
     case kIROp_EnumCast:
     case kIROp_CastUInt2ToDescriptorHandle:
     case kIROp_CastDescriptorHandleToUInt2:
+    case kIROp_CastUInt64ToDescriptorHandle:
+    case kIROp_CastDescriptorHandleToUInt64:
     case kIROp_CastDescriptorHandleToResource:
+    case kIROp_CastResourceToDescriptorHandle:
     case kIROp_GetDynamicResourceHeap:
     case kIROp_CastDynamicResource:
     case kIROp_AllocObj:
@@ -8739,6 +8866,15 @@ IRType* unwrapArray(IRType* type)
         t = arrayType->getElementType();
     }
     return t;
+}
+
+IRType* unwrapArrayAndPointers(IRType* type)
+{
+    if (const auto a = as<IRArrayTypeBase>(type))
+        return unwrapArrayAndPointers(a->getElementType());
+    if (const auto p = as<IRPtrTypeBase>(type))
+        return unwrapArrayAndPointers(p->getValueType());
+    return type;
 }
 
 //
@@ -9085,7 +9221,7 @@ bool isMovableInst(IRInst* inst)
     case kIROp_GetOffsetPtr:
     case kIROp_UpdateElement:
     case kIROp_Specialize:
-    case kIROp_LookupWitness:
+    case kIROp_LookupWitnessMethod:
     case kIROp_OptionalHasValue:
     case kIROp_GetOptionalValue:
     case kIROp_MakeOptionalValue:
@@ -9098,8 +9234,8 @@ bool isMovableInst(IRInst* inst)
     case kIROp_MakeMatrix:
     case kIROp_MakeMatrixFromScalar:
     case kIROp_MakeVectorFromScalar:
-    case kIROp_swizzle:
-    case kIROp_swizzleSet:
+    case kIROp_Swizzle:
+    case kIROp_SwizzleSet:
     case kIROp_MatrixReshape:
     case kIROp_MakeString:
     case kIROp_MakeResultError:

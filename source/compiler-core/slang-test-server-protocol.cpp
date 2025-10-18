@@ -11,6 +11,7 @@ static const StructRttiInfo _makeExecuteUnitTestArgsRtti()
     builder.addField("moduleName", &obj.moduleName);
     builder.addField("testName", &obj.testName);
     builder.addField("enabledApis", &obj.enabledApis);
+    builder.addField("enableDebugLayers", &obj.enableDebugLayers);
     return builder.make();
 }
 /* static */ const UnownedStringSlice ExecuteUnitTestArgs::g_methodName =
@@ -35,6 +36,7 @@ static const StructRttiInfo _makeExecutionResultRtti()
     StructRttiBuilder builder(&obj, "TestServerProtocol::ExecutionResult", nullptr);
     builder.addField("stdOut", &obj.stdOut);
     builder.addField("stdError", &obj.stdError);
+    builder.addField("debugLayer", &obj.debugLayer);
     builder.addField("result", &obj.result);
     builder.addField("returnCode", &obj.returnCode);
     return builder.make();

@@ -3,6 +3,9 @@
 #pragma once
 
 #include "slang-ast-base.h"
+#include "slang-fossil.h"
+
+//
 #include "slang-ast-decl.h.fiddle"
 
 FIDDLE()
@@ -25,84 +28,292 @@ class UnresolvedDecl : public Decl
     FIDDLE(...)
 };
 
+/// Holds the direct member declarations of a `ContainerDecl`.
+///
+/// This type is used to encapsulate the logic the creating
+/// and maintaing the acceleration structures used for member
+/// lookup.
+///
+struct ContainerDeclDirectMemberDecls
+{
+public:
+    List<Decl*> const& getDecls() const;
+
+    Count getDeclCount() const;
+    Decl* getDecl(Index index) const;
+
+    Decl* findLastDeclOfName(Name* name) const;
+
+    Dictionary<Name*, Decl*> getMapFromNameToLastDeclOfThatName() const;
+
+    List<Decl*> const& getTransparentDecls() const;
+
+    bool isUsingOnDemandDeserialization() const;
+
+    void _initForOnDemandDeserialization(
+        RefObject* deserializationContext,
+        void const* deserializationData,
+        Count declCount);
+
+private:
+    friend class ContainerDecl;
+    friend class ModuleDecl;
+    friend struct ASTDumpContext;
+
+    bool _areLookupAcceleratorsValid() const;
+    void _invalidateLookupAccelerators() const;
+    void _ensureLookupAcceleratorsAreValid() const;
+
+    void _readSerializedTransparentDecls() const;
+    Decl* _readSerializedDeclAtIndex(Index index) const;
+    Decl* _readSerializedDeclsOfName(Name* name) const;
+
+    void _readAllSerializedDecls() const;
+
+    mutable List<Decl*> decls;
+
+    mutable struct
+    {
+        Count declCountWhenLastUpdated = 0;
+
+        Dictionary<Name*, Decl*> mapNameToLastDeclOfThatName;
+        List<Decl*> filteredListOfTransparentDecls;
+    } accelerators;
+
+    mutable struct
+    {
+        RefPtr<RefObject> context;
+        void const* data = nullptr;
+    } onDemandDeserialization;
+};
+
+/// A conceptual list of declarations of the same name, in the same container.
+struct DeclsOfNameList
+{
+public:
+    DeclsOfNameList() {}
+
+    explicit DeclsOfNameList(Decl* decl)
+        : _lastDecl(decl)
+    {
+    }
+
+    struct Iterator
+    {
+    public:
+        Iterator() {}
+        Iterator(Decl* decl)
+            : _decl(decl)
+        {
+        }
+
+        Decl* operator*() const { return _decl; }
+
+        Iterator& operator++()
+        {
+            SLANG_ASSERT(_decl);
+            _decl = _decl->_prevInContainerWithSameName;
+            return *this;
+        }
+
+        bool operator!=(const Iterator& other) const { return _decl != other._decl; }
+
+    private:
+        Decl* _decl = nullptr;
+    };
+
+    Iterator begin() const { return _lastDecl; }
+    Iterator end() const { return nullptr; }
+
+private:
+    Decl* _lastDecl = nullptr;
+};
+
 // A "container" decl is a parent to other declarations
 FIDDLE(abstract)
 class ContainerDecl : public Decl
 {
     FIDDLE(...)
 
-    FIDDLE() List<Decl*> members;
     SourceLoc closingSourceLoc;
 
     // The associated scope owned by this decl.
     Scope* ownedScope = nullptr;
 
+    /// Get all of the direct member declarations inside this container decl.
+    ///
+    List<Decl*> const& getDirectMemberDecls();
+
+    /// Get the number of direct member declarations inside this container decl.
+    ///
+    Count getDirectMemberDeclCount();
+
+    /// Get the direct member declaration of this container decl at the given `index`.
+    ///
+    Decl* getDirectMemberDecl(Index index);
+
+    /// Get the first direct member declaration inside of this container decl, if any.
+    ///
+    /// If the container has no direct member declarations, returns null.
+    ///
+    Decl* getFirstDirectMemberDecl();
+
+    /// Get all of the direct member declarations inside of this container decl
+    /// that are instances of the specified AST node type `T`.
+    ///
+    template<typename T>
+    FilteredMemberList<T> getDirectMemberDeclsOfType()
+    {
+        return FilteredMemberList<T>(getDirectMemberDecls());
+    }
+
+    /// Find the first direct member declaration of this container decl that
+    /// is an instance of the specified AST node type `T`.
+    ///
+    /// If there are no direct member declrations of type `T`, then returns null.
+    /// Otherwise, returns the first matching member, in declaration order.
+    ///
+    template<typename T>
+    T* findFirstDirectMemberDeclOfType()
+    {
+        auto count = getDirectMemberDeclCount();
+        for (Index i = 0; i < count; ++i)
+        {
+            auto decl = getDirectMemberDecl(i);
+            if (auto found = as<T>(decl))
+                return found;
+        }
+        return nullptr;
+    }
+
+    /// Find all direct member declarations of this container decl that have the given name.
+    ///
+    DeclsOfNameList getDirectMemberDeclsOfName(Name* name);
+
+    /// Find the last direct member declaration of this container decl that has the given name.
+    ///
+    Decl* findLastDirectMemberDeclOfName(Name* name);
+
+    /// Get the previous direct member declaration that has the same name as `decl`.
+    ///
+    Decl* getPrevDirectMemberDeclWithSameName(Decl* decl);
+
+    /// Append the given `decl` to the direct member declarations of this container decl.
+    ///
+    void addDirectMemberDecl(Decl* decl);
+
+    /// Get the subset of direct member declarations that are "transparent."
+    ///
+    /// Transparent members will themselves be considered when performing
+    /// looking on the parent. E.g., if `a` has a transparent member `b`,
+    /// then a lookup like `a.x` will also consider `a.b.x` as a possible
+    /// result.
+    ///
+    List<Decl*> const& getTransparentDirectMemberDecls();
+
+    // Note: Just an alias for `getDirectMemberDecls()`,
+    // but left in place because of just how many call sites were
+    // already using this name.
+    //
+    List<Decl*> const& getMembers() { return getDirectMemberDecls(); }
+
+    // Note: Just an alias for `getDirectMemberDeclsOfType()`,
+    // but left in place because of just how many call sites were
+    // already using this name.
+    //
     template<typename T>
     FilteredMemberList<T> getMembersOfType()
     {
-        return FilteredMemberList<T>(members);
+        return getDirectMemberDeclsOfType<T>();
     }
 
-    void buildMemberDictionary();
+    // Note: Just an alias for `addDirectMemberDecl()`,
+    // but left in place because of just how many call sites were
+    // already using this name.
+    //
+    void addMember(Decl* member) { addDirectMemberDecl(member); }
 
-    bool isMemberDictionaryValid() const { return dictionaryLastCount == members.getCount(); }
+    /// Is this declaration using on-demand deserialization for its direct members?
+    ///
+    bool isUsingOnDemandDeserializationForDirectMembers();
 
-    void invalidateMemberDictionary()
-    {
-        dictionaryLastCount = -1;
-        mapDeclMemberToIndex.clear();
-    }
+    //
+    // NOTE: The operations after this point are *not* considered part of
+    // the public API of `ContainerDecl`, and new code should not be
+    // written that uses them.
+    //
+    // They are being left in place because the existing code that uses
+    // them would be difficult or impossible to refactor to use the public
+    // API, but such parts of the codebase should *not* be considered as
+    // examples of how to interact with the Slang AST.
+    //
 
-    Dictionary<Name*, Decl*>& getMemberDictionary()
-    {
-        buildMemberDictionary();
-        return memberDictionary;
-    }
+    /// Remove a constructor declaration from the direct member declarations of this container.
+    ///
+    /// This operation is seemingly used when a default constructor declaration has been synthesized
+    /// for a type, but that type already contained a default constructor of its own.
+    ///
+    /// TODO: Somebody should investigate why this operation is even needed; it seems like an
+    /// indication that we are doing something Deeply Wrong in the way that default constructors are
+    /// being handled and synthesized (on top of the things that we know are Wrong By Design).
+    ///
+    void _removeDirectMemberConstructorDeclBecauseSynthesizedAnotherDefaultConstructorInstead(
+        ConstructorDecl* decl);
 
-    List<TransparentMemberInfo>& getTransparentMembers()
-    {
-        buildMemberDictionary();
-        return transparentMembers;
-    }
+    /// Replace the given `oldVarDecl` with the given `newPropertyDecl` in the direct member
+    /// declarations of this container decl, because the variable declaration had a bit-field
+    /// specification on it, and the property was synthesized to stand in for that variable
+    /// by providing a getter/settter pair.
+    ///
+    /// This operation cannot be expressed in terms of the rest of the public API, because there
+    /// is currently no other example of parsing a declaration as one AST node class, and
+    /// then determining as part of semantic checking that it should *actually* be represented
+    /// as a different class of declaration entirely.
+    ///
+    /// TODO: In the long run we would either eliminate support for C-style bit-field specifications
+    /// on what would otherwise be an ordinary member variable declaration. Some other syntax, or
+    /// a type-based solution, should be introduced to server the same use cases, without requiring
+    /// us to parse something as a variable that is semantically *not* a variable in almost any
+    /// of the ways that count.
+    ///
+    void _replaceDirectMemberBitFieldVariableDeclAtIndexWithPropertyDeclThatWasSynthesizedForIt(
+        Index index,
+        VarDecl* oldVarDecl,
+        PropertyDecl* newPropertyDecl);
 
-    void addMember(Decl* member)
-    {
-        if (member)
-        {
-            member->parentDecl = this;
-            auto index = members.getCount();
-            members.add(member);
-            mapDeclMemberToIndex[member] = index;
-        }
-    }
+    /// Insert `backingVarDecl` into this container declaration at `index`, to handle the case
+    /// where the backing variable has been synthesized to store the bits of one or more bitfield
+    /// properties.
+    ///
+    /// This operation cannot be expressed in terms of the rest of the public API because the usual
+    /// assumption is that member declarations may be added to a declaration but that, once added,
+    /// their indices in the member list are consistent and stable.
+    ///
+    /// The reason the code that calls this operation can't just add `backingVarDecl` to the end of
+    /// the declaration is that there is an underlying assumption made by users that any
+    /// non-bitfield members before/after a bitfield declaration will have their storage laid out
+    /// before/after the storage for that bitfield.
+    ///
+    /// TODO: A simple cleanup would be to *not* guarantee the order of storage layout for bitfield
+    /// members relative to other member variables, but the real long-term fix is to have an
+    /// alternative means for users to define bitfields that does not inherit the C-like syntax, and
+    /// that can make the storage that is introduced clear at parse time, so that the relevant
+    /// declaration(s) can already be in the correct order.
+    ///
+    void _insertDirectMemberDeclAtIndexForBitfieldPropertyBackingMember(
+        Index index,
+        VarDecl* backingVarDecl);
 
-    static void setParent(ContainerDecl* parent, Decl* child)
-    {
-        if (child)
-            child->parentDecl = parent;
-        if (parent)
-            parent->addMember(child);
-    }
-
-    Index getDeclIndex(Decl* d);
+    // TODO: The following should be a private member, but currently
+    // we have auto-generated code for things like dumping and serialization
+    // that expect to have access to it.
+    //
+    FIDDLE() ContainerDeclDirectMemberDecls _directMemberDecls;
 
 private:
-    // Denotes how much of Members has been placed into the dictionary/transparentMembers.
-    // If this value equals the Members.getCount(), the dictionary is completely full and valid.
-    // If it's >= 0, then the Members after dictionaryLastCount are all that need to be added.
-    // If it < 0 it means that the dictionary/transparentMembers is invalid and needs to be
-    // recreated.
-    Index dictionaryLastCount = 0;
-
-    // Dictionary for looking up members by name.
-    // This is built on demand before performing lookup.
-    Dictionary<Name*, Decl*> memberDictionary;
-
-    Dictionary<Decl*, Index> mapDeclMemberToIndex;
-
-    // A list of transparent members, to be used in lookup
-    // Note: this is only valid if `memberDictionaryIsValid` is true
-    List<TransparentMemberInfo> transparentMembers;
+    bool _areLookupAcceleratorsValid();
+    void _invalidateLookupAccelerators();
+    void _ensureLookupAcceleratorsAreValid();
 };
 
 // Base class for all variable declarations
@@ -166,6 +377,7 @@ enum class TypeTag
     Incomplete = 2,
     LinkTimeSized = 4,
     Opaque = 8,
+    NonAddressable = 16,
 };
 
 // Declaration of a type that represents some sort of aggregate
@@ -175,8 +387,16 @@ class AggTypeDecl : public AggTypeDeclBase
     FIDDLE(...)
     FIDDLE() TypeTag typeTags = TypeTag::None;
 
-    // Used if this type declaration is a wrapper, i.e. struct FooWrapper:IFoo = Foo;
-    TypeExp wrappedType;
+    // When user defines an agg type in the syntax of
+    // `struct FooAlias : IFoo = Foo;`
+    // The user is defining a link-time type alias. In contrast
+    // to an ordinary typealias, a link-time alias is not folded in
+    // the front-end, and resolved during linking.
+    // `aliasedType` is used to store the alised type (in this case `Foo`)
+    // when the agg type decl is declared in the link-time alias syntax.
+    //
+    TypeExp aliasedType;
+
     bool hasBody = true;
 
     void unionTagsWith(TypeTag other);
@@ -295,6 +515,13 @@ class InheritanceDecl : public TypeConstraintDecl
     // this inheritance declaration.
     FIDDLE() RefPtr<WitnessTable> witnessTable;
 
+    // If the inheritance decl is in a link-time type declaration
+    // (e.g. `export struct Foo : IFoo = FooImpl;`), then we will
+    // store the witness that `FooImpl:IFoo` here.
+    // TODO: If we made `WitnessTable` a `Val`, we should be able
+    // to unify these two cases.
+    FIDDLE() Witness* witnessVal = nullptr;
+
     // Overrides should be public so base classes can access
     const TypeExp& _getSupOverride() const { return base; }
 };
@@ -405,7 +632,7 @@ FIDDLE(abstract)
 class FunctionDeclBase : public CallableDecl
 {
     FIDDLE(...)
-    FIDDLE() Stmt* body = nullptr;
+    Stmt* body = nullptr;
 };
 
 // A constructor/initializer to create instances of a type
@@ -541,6 +768,14 @@ class ModuleDecl : public NamespaceDeclBase
     /// This mapping is filled in during semantic checking, as `ExtensionDecl`s get checked.
     ///
     FIDDLE() Dictionary<AggTypeDecl*, RefPtr<CandidateExtensionList>> mapTypeToCandidateExtensions;
+
+    /// Is this module using on-demand deserialization for its exports?
+    ///
+    bool isUsingOnDemandDeserializationForExports();
+
+    /// Find a declaration exported from this module by its `mangledName`.
+    ///
+    Decl* _findSerializedDeclByMangledExportName(UnownedStringSlice const& mangledName);
 };
 
 // Represents a transparent scope of declarations that are defined in a single source file.
@@ -625,6 +860,21 @@ class GenericDecl : public ContainerDecl
     FIDDLE(...)
     // The decl that is genericized...
     FIDDLE() Decl* inner = nullptr;
+
+    /// A cached list of arguments that can be used when forming
+    /// a reference to the inner declaration with "default
+    /// substitutions" (for each generic parameter, the coresponding
+    /// argument will be a reference to the parameter itself).
+    ///
+    List<Val*> _cachedArgsForDefaultSubstitution;
+};
+
+FIDDLE()
+class InterfaceDefaultImplDecl : public GenericDecl
+{
+    FIDDLE(...)
+    FIDDLE() GenericTypeParamDecl* thisTypeDecl;
+    FIDDLE() GenericTypeConstraintDecl* thisTypeConstraintDecl;
 };
 
 FIDDLE(abstract)
@@ -714,7 +964,8 @@ class SyntaxDecl : public Decl
 {
     FIDDLE(...)
     // What type of syntax node will be produced when parsing with this keyword?
-    FIDDLE() SyntaxClass<NodeBase> syntaxClass;
+    FIDDLE()
+    SyntaxClass<NodeBase> syntaxClass;
 
     // Callback to invoke in order to parse syntax with this keyword.
     SyntaxParseCallback parseCallback = nullptr;
@@ -779,5 +1030,9 @@ void addSiblingScopeForContainerDecl(
     ContainerDecl* dest,
     ContainerDecl* source);
 void addSiblingScopeForContainerDecl(ASTBuilder* builder, Scope* destScope, ContainerDecl* source);
+
+// Cast `decl` to a valid `ContainerDecl*` if its members will become global scope symbols after
+// lowering to IR. This currently includes: `NamespaceDecl`, `ModuleDecl` and `FileDecl`.
+ContainerDecl* isStaticScopeDecl(Decl* decl);
 
 } // namespace Slang

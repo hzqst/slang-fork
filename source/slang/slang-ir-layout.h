@@ -56,6 +56,12 @@ struct IRTypeLayoutRules
 public:
     IRTypeLayoutRuleName ruleName;
 
+    /// This function calculates the size and alignment of the given type.
+    virtual Result calcSizeAndAlignment(
+        CompilerOptionSet& optionSet,
+        IRType* type,
+        IRSizeAndAlignment* outSizeAndAlignment);
+
     /// Align composite based on rule. Type is aligned assuming
     /// it is apart of a composite (array, struct, matrix, etc...)
     virtual IRSizeAndAlignment alignCompositeElement(IRSizeAndAlignment elementSize) = 0;
@@ -65,12 +71,21 @@ public:
     virtual IRSizeAndAlignment getVectorSizeAndAlignment(
         IRSizeAndAlignment element,
         IRIntegerValue count) = 0;
-    virtual IRIntegerValue adjustOffsetForNextAggregateMember(
-        IRIntegerValue currentSize,
-        IRIntegerValue lastElementAlignment) = 0;
+
+    /// Adjust the offset of an element. Handles two cases; alignmment when
+    /// the previous field was a composite, and the D3D constant buffer case
+    /// where an element is aligned to the next 16-byte boundary if it doesn't
+    /// fit entirely within the current one.
+    virtual IRIntegerValue adjustOffset(
+        IRIntegerValue offset,
+        IRIntegerValue elementSize,
+        IRType* lastFieldType,
+        IRIntegerValue lastFieldAlignment) = 0;
+
     static IRTypeLayoutRules* getStd430();
     static IRTypeLayoutRules* getStd140();
     static IRTypeLayoutRules* getNatural();
+    static IRTypeLayoutRules* getC();
     static IRTypeLayoutRules* getConstantBuffer();
     static IRTypeLayoutRules* get(IRTypeLayoutRuleName name);
 };

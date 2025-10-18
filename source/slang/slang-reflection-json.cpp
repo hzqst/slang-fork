@@ -3,6 +3,7 @@
 
 #include "../core/slang-blob.h"
 #include "slang-ast-support-types.h"
+#include "slang.h"
 
 template<typename T>
 struct Range
@@ -56,12 +57,14 @@ namespace Slang
 static void emitReflectionVarInfoJSON(PrettyWriter& writer, slang::VariableReflection* var);
 static void emitReflectionTypeLayoutJSON(PrettyWriter& writer, slang::TypeLayoutReflection* type);
 static void emitReflectionTypeJSON(PrettyWriter& writer, slang::TypeReflection* type);
+static slang::ShaderReflection* g_inProgramLayout = nullptr;
 
 static void emitReflectionVarBindingInfoJSON(
     PrettyWriter& writer,
     SlangParameterCategory category,
     SlangUInt index,
     SlangUInt count,
+    SlangUInt stride,
     SlangUInt space = 0)
 {
     if (category == SLANG_PARAMETER_CATEGORY_UNIFORM)
@@ -71,6 +74,8 @@ static void emitReflectionVarBindingInfoJSON(
         writer << "\"offset\": " << index;
         writer << ", ";
         writer << "\"size\": " << count;
+        writer << ", ";
+        writer << "\"elementStride\": " << stride;
     }
     else
     {
@@ -159,6 +164,12 @@ static void emitReflectionVarBindingInfoJSON(
         case SLANG_STAGE_COMPUTE:
             stageName = "compute";
             break;
+        case SLANG_STAGE_MESH:
+            stageName = "mesh";
+            break;
+        case SLANG_STAGE_AMPLIFICATION:
+            stageName = "amplification";
+            break;
 
         default:
             break;
@@ -189,6 +200,7 @@ static void emitReflectionVarBindingInfoJSON(
             auto index = var->getOffset(category);
             auto space = var->getBindingSpace(category);
             auto count = typeLayout->getSize(category);
+            auto elementStride = typeLayout->getElementStride(category);
 
             // Query the paramater usage for the specified entry point.
             // Note: both `request` and `entryPointIndex` may be invalid here, but that should just
@@ -208,7 +220,7 @@ static void emitReflectionVarBindingInfoJSON(
 
             writer << "{";
 
-            emitReflectionVarBindingInfoJSON(writer, category, index, count, space);
+            emitReflectionVarBindingInfoJSON(writer, category, index, count, elementStride, space);
 
             if (usedAvailable)
             {
@@ -361,6 +373,26 @@ static void emitUserAttributes(PrettyWriter& writer, slang::FunctionReflection* 
     }
 }
 
+static slang::TypeLayoutReflection* maybeChangeTypeLayoutToAgumentBufferTier2(
+    slang::VariableLayoutReflection* varLayout)
+{
+    if (varLayout->getCategoryCount() != 0)
+    {
+        for (unsigned int categoryIdx = 0; categoryIdx < varLayout->getCategoryCount();
+             categoryIdx++)
+        {
+            auto category = varLayout->getCategoryByIndex(categoryIdx);
+            if (category == slang::MetalArgumentBufferElement)
+            {
+                return g_inProgramLayout->getTypeLayout(
+                    varLayout->getTypeLayout()->getType(),
+                    slang::LayoutRules::MetalArgumentBufferTier2);
+            }
+        }
+    }
+    return nullptr;
+}
+
 static void emitReflectionVarLayoutJSON(PrettyWriter& writer, slang::VariableLayoutReflection* var)
 {
     writer << "{\n";
@@ -376,13 +408,18 @@ static void emitReflectionVarLayoutJSON(PrettyWriter& writer, slang::VariableLay
 
     writer.maybeComma();
     writer << "\"type\": ";
-    emitReflectionTypeLayoutJSON(writer, var->getTypeLayout());
+    if (auto newTypeLayout = maybeChangeTypeLayoutToAgumentBufferTier2(var))
+    {
+        emitReflectionTypeLayoutJSON(writer, newTypeLayout);
+    }
+    else
+    {
+        emitReflectionTypeLayoutJSON(writer, var->getTypeLayout());
+    }
 
     emitReflectionModifierInfoJSON(writer, var->getVariable());
 
     emitReflectionVarBindingInfoJSON(writer, var);
-
-    emitUserAttributes(writer, var->getVariable());
     writer.dedent();
     writer << "\n}";
 }
@@ -466,6 +503,11 @@ static void emitReflectionResourceTypeBaseInfoJSON(
     {
         writer.maybeComma();
         writer << "\"feedback\": true";
+    }
+    if (shape & SLANG_TEXTURE_COMBINED_FLAG)
+    {
+        writer.maybeComma();
+        writer << "\"combined\": true";
     }
 
     if (access != SLANG_RESOURCE_ACCESS_READ)
@@ -676,8 +718,26 @@ static void emitReflectionTypeInfoJSON(PrettyWriter& writer, slang::TypeReflecti
         writer.maybeComma();
         writer << "\"kind\": \"DynamicResource\"";
         break;
+    case slang::TypeReflection::Kind::OutputStream:
+        writer.maybeComma();
+        writer << "\"kind\": \"OutputStream\"";
+        break;
+    case slang::TypeReflection::Kind::MeshOutput:
+        writer.maybeComma();
+        writer << "\"kind\": \"MeshOutput\"";
+        break;
+    case slang::TypeReflection::Kind::Specialized:
+        writer.maybeComma();
+        writer << "\"kind\": \"Specialized\"";
+        break;
+    case slang::TypeReflection::Kind::None:
+        writer.maybeComma();
+        writer << "\"kind\": \"None\"";
+        break;
     default:
-        assert(!"unhandled case");
+        SLANG_ASSERT(!"Unhandled type kind");
+        writer.maybeComma();
+        writer << "\"kind\": \"Unknown\"";
         break;
     }
     emitUserAttributes(writer, type);
@@ -693,7 +753,18 @@ static void emitReflectionParameterGroupTypeLayoutInfoJSON(
     writer << "\"";
 
     writer << ",\n\"elementType\": ";
-    emitReflectionTypeLayoutJSON(writer, typeLayout->getElementTypeLayout());
+
+    if (auto newElementTypeLayout =
+            maybeChangeTypeLayoutToAgumentBufferTier2(typeLayout->getElementVarLayout()))
+    {
+        // If we are in argument buffer tier 2, we need to use the new type layout
+        // that has the correct binding information.
+        emitReflectionTypeLayoutJSON(writer, newElementTypeLayout);
+    }
+    else
+    {
+        emitReflectionTypeLayoutJSON(writer, typeLayout->getElementTypeLayout());
+    }
 
     // Note: There is a subtle detail below when it comes to the
     // container/element variable layouts that get nested inside
@@ -1060,6 +1131,12 @@ static void emitReflectionEntryPointJSON(
     case SLANG_STAGE_COMPUTE:
         writer << ",\n\"stage\": \"compute\"";
         break;
+    case SLANG_STAGE_MESH:
+        writer << ",\n\"stage\": \"mesh\"";
+        break;
+    case SLANG_STAGE_AMPLIFICATION:
+        writer << ",\n\"stage\": \"amplification\"";
+        break;
     default:
         break;
     }
@@ -1231,6 +1308,7 @@ void emitReflectionJSON(
     PrettyWriter& writer)
 {
     auto programReflection = (slang::ShaderReflection*)reflection;
+    g_inProgramLayout = programReflection;
     emitReflectionJSON(writer, request, programReflection);
 }
 

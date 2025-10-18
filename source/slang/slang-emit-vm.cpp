@@ -247,6 +247,17 @@ public:
             operand = addConstantValue(constantInst);
             mapInstToOperand[inst] = operand;
         }
+        else if (auto constantVector = as<IRMakeVector>(inst))
+        {
+            SLANG_ASSERT(constantVector->getOperandCount() > 0);
+            operand = ensureInst(constantVector->getOperand(0));
+            for (UInt i = 1; i < constantVector->getOperandCount(); i++)
+            {
+                ensureInst(constantVector->getOperand(i));
+            }
+            operand.size *= (uint32_t)constantVector->getOperandCount();
+            mapInstToOperand[inst] = operand;
+        }
         else
         {
             SLANG_UNEXPECTED("unsupported global inst for vm bytecode emit");
@@ -260,7 +271,7 @@ public:
         uint32_t extOp,
         ArrayView<VMOperand> operands)
     {
-        VMInstHeader instHeader;
+        VMInstHeader instHeader = {};
         instHeader.opcode = op;
         instHeader.opcodeExtension = extOp;
         instHeader.operandCount = (uint16_t)operands.getCount();
@@ -356,9 +367,9 @@ public:
         case kIROp_UInt64Type:
         case kIROp_UIntPtrType:
         case kIROp_PtrType:
-        case kIROp_OutType:
-        case kIROp_InOutType:
-        case kIROp_RefType:
+        case kIROp_OutParamType:
+        case kIROp_BorrowInOutParamType:
+        case kIROp_RefParamType:
         case kIROp_NativePtrType:
             extCode.scalarType = kSlangByteCodeScalarTypeUnsignedInt;
             extCode.scalarBitWidth = 3;
@@ -481,8 +492,12 @@ public:
     {
         switch (inst->getOp())
         {
-        case kIROp_undefined:
+        case kIROp_Poison:
+        case kIROp_LoadFromUninitializedMemory:
             {
+                // We basically handle an undefined value by allocating a
+                // temporary and then not initializing it.
+                //
                 ensureWorkingsetMemory(funcBuilder, inst);
             }
             break;
@@ -605,8 +620,8 @@ public:
                     ensureInst(inst->getOperand(0)));
             }
             break;
-        case kIROp_unconditionalBranch:
-        case kIROp_loop:
+        case kIROp_UnconditionalBranch:
+        case kIROp_Loop:
             {
                 // Write phi arguments into param registers.
                 auto branch = as<IRUnconditionalBranch>(inst);
@@ -646,7 +661,7 @@ public:
                 relocations.add(entry);
             }
             break;
-        case kIROp_ifElse:
+        case kIROp_IfElse:
             {
                 VMOperand relocOperand = {};
                 writeInst(
@@ -868,7 +883,7 @@ public:
         case kIROp_FloatCast:
             emitCast(funcBuilder, VMOp::Cast, inst);
             break;
-        case kIROp_swizzle:
+        case kIROp_Swizzle:
             {
                 auto swizzleInst = as<IRSwizzle>(inst);
                 auto base = swizzleInst->getBase();

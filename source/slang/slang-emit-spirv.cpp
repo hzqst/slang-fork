@@ -216,7 +216,7 @@ struct SpvInst : SpvInstParent
         //
         // > Word Count: The complete number of words taken by an instruction,
         // > including the word holding the word count and opcode, and any optional
-        // > operands. An instruction’s word count is the total space taken by the instruction.
+        // > operands. An instruction's word count is the total space taken by the instruction.
         //
         SpvWord wordCount = 1 + SpvWord(operandWordsCount);
 
@@ -1500,12 +1500,30 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
             m_addressingMode,
             m_memoryModel);
 
+        // Emit OpSamplerImageAddressingModeNV if bindless texture capability is enabled
+        auto targetCaps = m_targetProgram->getTargetReq()->getTargetCaps();
+
+        if (targetCaps.implies(CapabilityAtom::spvBindlessTextureNV))
+        {
+            requireSPIRVCapability((SpvCapability)SpvCapabilityBindlessTextureNV);
+            requireSPIRVCapability(SpvCapabilityInt64); // Required for 64-bit addressing mode
+            ensureExtensionDeclaration(UnownedStringSlice("SPV_NV_bindless_texture"));
+
+            emitInstCustomOperandFunc(
+                getSection(SpvLogicalSectionID::MemoryModel),
+                nullptr,
+                SpvOpSamplerImageAddressingModeNV,
+                [&]()
+                {
+                    emitOperand(SpvWord(64)); // 64-bit addressing mode
+                });
+        }
+
         if (m_memoryModel == SpvMemoryModelVulkan)
         {
             requireSPIRVCapability(SpvCapabilityVulkanMemoryModel);
             ensureExtensionDeclaration(UnownedStringSlice("SPV_KHR_vulkan_memory_model"));
 
-            auto targetCaps = m_targetProgram->getTargetReq()->getTargetCaps();
             if (targetCaps.implies(CapabilityAtom::spvVulkanMemoryModelDeviceScopeKHR))
             {
                 requireSPIRVCapability(SpvCapabilityVulkanMemoryModelDeviceScope);
@@ -1775,10 +1793,10 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                 return emitOpTypeFloat(inst, SpvLiteralInteger::from32(int32_t(i.width)));
             }
         case kIROp_PtrType:
-        case kIROp_RefType:
-        case kIROp_ConstRefType:
-        case kIROp_OutType:
-        case kIROp_InOutType:
+        case kIROp_RefParamType:
+        case kIROp_BorrowInParamType:
+        case kIROp_OutParamType:
+        case kIROp_BorrowInOutParamType:
             {
                 SpvStorageClass storageClass = SpvStorageClassFunction;
                 auto ptrType = as<IRPtrTypeBase>(inst);
@@ -1802,6 +1820,10 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                 }
 
                 auto valueType = ptrType->getValueType();
+
+                // Check for 8/16-bit storage capabilities when emitting pointer types
+                requireCapabilitiesForType(valueType, storageClass);
+
                 // If we haven't emitted the inner type yet, we need to emit a forward declaration.
                 bool useForwardDeclaration =
                     (!m_mapIRInstToSpvInst.containsKey(valueType) && as<IRStructType>(valueType) &&
@@ -1840,17 +1862,30 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                             (IRPtrTypeBase*)inst))
                         emitOpTypeForwardPointer(resultSpvType, storageClass);
                 }
-                if (storageClass == SpvStorageClassPhysicalStorageBuffer)
+                if (storageClass == SpvStorageClassPhysicalStorageBuffer ||
+                    storageClass == SpvStorageClassStorageBuffer)
                 {
                     if (m_decoratedSpvInsts.add(getID(resultSpvType)))
                     {
                         IRSizeAndAlignment sizeAndAlignment;
                         uint32_t stride;
 
-                        getNaturalSizeAndAlignment(
-                            m_targetProgram->getOptionSet(),
-                            valueType,
-                            &sizeAndAlignment);
+                        if (auto layout = valueType->findDecoration<IRSizeAndAlignmentDecoration>())
+                        {
+                            auto rule = IRTypeLayoutRules::get(layout->getLayoutName());
+                            getSizeAndAlignment(
+                                m_targetProgram->getOptionSet(),
+                                rule,
+                                valueType,
+                                &sizeAndAlignment);
+                        }
+                        else
+                        {
+                            getNaturalSizeAndAlignment(
+                                m_targetProgram->getOptionSet(),
+                                valueType,
+                                &sizeAndAlignment);
+                        }
                         uint64_t valueSize = sizeAndAlignment.size;
 
                         // Any unsized data type (e.g. struct or array) will have size of
@@ -1859,11 +1894,14 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                         stride = (valueSize >= (uint64_t)sizeAndAlignment.kIndeterminateSize)
                                      ? 0xFFFF
                                      : (uint32_t)sizeAndAlignment.getStride();
-                        emitOpDecorateArrayStride(
-                            getSection(SpvLogicalSectionID::Annotations),
-                            nullptr,
-                            resultSpvType,
-                            SpvLiteralInteger::from32(stride));
+                        if (stride != 0)
+                        {
+                            emitOpDecorateArrayStride(
+                                getSection(SpvLogicalSectionID::Annotations),
+                                nullptr,
+                                resultSpvType,
+                                SpvLiteralInteger::from32(stride));
+                        }
                     }
                 }
                 return resultSpvType;
@@ -2060,17 +2098,26 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                     inst->getOp() == kIROp_ArrayType
                         ? emitOpTypeArray(inst, elementType, irArrayType->getElementCount())
                         : emitOpTypeRuntimeArray(inst, elementType);
-                if (shouldEmitArrayStride(irArrayType->getElementType()))
+                // Arrays of opaque types should not emit a stride
+                if (!isIROpaqueType(elementType) &&
+                    shouldEmitArrayStride(irArrayType->getElementType()))
                 {
                     auto stride = 0;
+                    // If the array type has no stride, it indicates that this array type is only
+                    // used in Private or Function storage class (aka. thread-local or function
+                    // scope variable), in that case SPIRV doesn't allow to decorate the array
+                    // stride.
+                    //
+                    // The only exception is if the array type is unsized, because unsized array
+                    // also has no stride operand, however unsized array can not be used in Private
+                    // or Function, so we are safe to just decorate the stride for unsized array by
+                    // calculating the natural stride.
                     if (auto strideInst = irArrayType->getArrayStride())
                     {
                         stride = (int)getIntVal(strideInst);
                     }
-                    else
+                    else if (inst->getOp() == kIROp_UnsizedArrayType)
                     {
-                        // Stride may not have been calculated for basic element types. Calculate it
-                        // here.
                         IRSizeAndAlignment sizeAndAlignment;
                         getNaturalSizeAndAlignment(
                             m_targetProgram->getOptionSet(),
@@ -2079,11 +2126,14 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                         stride = (int)sizeAndAlignment.getStride();
                     }
 
-                    emitOpDecorateArrayStride(
-                        getSection(SpvLogicalSectionID::Annotations),
-                        nullptr,
-                        arrayType,
-                        SpvLiteralInteger::from32(stride));
+                    if (stride != 0)
+                    {
+                        emitOpDecorateArrayStride(
+                            getSection(SpvLogicalSectionID::Annotations),
+                            nullptr,
+                            arrayType,
+                            SpvLiteralInteger::from32(stride));
+                    }
                 }
                 return arrayType;
             }
@@ -2097,7 +2147,25 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
             {
                 IRBuilder builder(inst);
                 builder.setInsertBefore(inst);
-                return emitOpTypeVector(inst, builder.getUIntType(), SpvLiteralInteger::from32(2));
+                auto targetCaps = m_targetProgram->getTargetReq()->getTargetCaps();
+
+                if (targetCaps.implies(CapabilityAtom::spvBindlessTextureNV))
+                {
+                    // For spvBindlessTextureNV, DescriptorHandleType should be a uint64_t
+                    // (OpTypeInt 64 0)
+                    return emitOpTypeInt(
+                        inst,
+                        SpvLiteralInteger::from32(64),
+                        SpvLiteralInteger::from32(0));
+                }
+                else
+                {
+                    // For other targets, use uint2 (OpTypeVector of 2 uint32)
+                    return emitOpTypeVector(
+                        inst,
+                        builder.getUIntType(),
+                        SpvLiteralInteger::from32(2));
+                }
             }
         case kIROp_SubpassInputType:
             return ensureSubpassInputType(inst, cast<IRSubpassInputType>(inst));
@@ -2265,7 +2333,9 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                 auto moduleInst = inst->getModule()->getModuleInst();
                 if (!m_defaultDebugSource)
                     m_defaultDebugSource = debugSource;
-                if (!m_mapIRInstToSpvDebugInst.containsKey(moduleInst))
+                // Only create DebugCompilationUnit for non-included files
+                auto isIncludedFile = as<IRBoolLit>(debugSource->getIsIncludedFile())->getValue();
+                if (!m_mapIRInstToSpvDebugInst.containsKey(moduleInst) && !isIncludedFile)
                 {
                     IRBuilder builder(inst);
                     builder.setInsertBefore(inst);
@@ -2283,6 +2353,18 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                     registerDebugInst(moduleInst, translationUnit);
                 }
                 return result;
+            }
+        case kIROp_DebugBuildIdentifier:
+            {
+                ensureExtensionDeclaration(UnownedStringSlice("SPV_KHR_non_semantic_info"));
+                auto debugBuildIdentifier = as<IRDebugBuildIdentifier>(inst);
+                return emitOpDebugBuildIdentifier(
+                    getSection(SpvLogicalSectionID::GlobalVariables),
+                    inst,
+                    inst->getFullType(),
+                    getNonSemanticDebugInfoExtInst(),
+                    debugBuildIdentifier->getBuildIdentifier(),
+                    debugBuildIdentifier->getFlags());
             }
         case kIROp_GetStringHash:
             return emitGetStringHash(inst);
@@ -2599,7 +2681,11 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
 
         // Vulkan spec 16.1: "The “Depth” operand of OpTypeImage is ignored."
         SpvWord depth =
-            ImageOpConstants::unknownDepthImage; // No knowledge of if this is a depth image
+            inst->isShadow()
+                ? ImageOpConstants::isDepthImage       // But we respect the `isShadow` flag of the
+                                                       // texture
+                : ImageOpConstants::unknownDepthImage; // No knowledge of if this is a depth image
+
         SpvWord ms = inst->isMultisample() ? ImageOpConstants::isMultisampled
                                            : ImageOpConstants::notMultisampled;
 
@@ -2976,7 +3062,7 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         bool anyModifiers = (var->findDecoration<IRInterpolationModeDecoration>() != nullptr);
 
         // If the user didn't explicitly qualify a varying
-        // with integer type, then we need to explicitly
+        // with integer or pointer type, then we need to explicitly
         // add the `flat` modifier for GLSL.
         if (!anyModifiers)
         {
@@ -2986,7 +3072,8 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                 layout->usesResourceKind(LayoutResourceKind::VaryingInput))
             {
                 const auto ptrType = as<IRPtrTypeBase>(var->getDataType());
-                if (ptrType && isIntegralScalarOrCompositeType(ptrType->getValueType()))
+                if (ptrType && (isIntegralScalarOrCompositeType(ptrType->getValueType()) ||
+                                as<IRPtrTypeBase>(ptrType->getValueType())))
                     emitOpDecorate(
                         getSection(SpvLogicalSectionID::Annotations),
                         nullptr,
@@ -3024,6 +3111,18 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                 nullptr,
                 spvInst,
                 nameDecor->getName());
+        }
+    }
+
+    void maybeEmitName(SpvInst* spvInst, IRInst* irInst, UnownedStringSlice prefix)
+    {
+        if (auto nameDecor = irInst->findDecoration<IRNameHintDecoration>())
+        {
+            emitOpName(
+                getSection(SpvLogicalSectionID::DebugNames),
+                nullptr,
+                spvInst,
+                (StringBuilder() << prefix << nameDecor->getName()).getUnownedSlice());
         }
     }
 
@@ -3135,7 +3234,9 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         if (opCode == SpvOpUndef)
         {
             String e = "Unhandled inst in spirv-emit:\n" +
-                       dumpIRToString(inst, {IRDumpOptions::Mode::Detailed, 0});
+                       dumpIRToString(
+                           inst,
+                           {IRDumpOptions::Mode::Detailed, IRDumpOptions::Flag::DumpDebugIds});
             SLANG_UNIMPLEMENTED_X(e.getBuffer());
         }
 
@@ -3181,6 +3282,7 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
             registerInst(param, systemValInst);
             return systemValInst;
         }
+
         auto varInst = emitOpVariable(
             getSection(SpvLogicalSectionID::GlobalVariables),
             param,
@@ -3191,6 +3293,7 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         if (layout)
             emitVarLayout(param, varInst, layout);
         emitDecorations(param, getID(varInst));
+        maybeEmitDebugGlobalVariable(param, varInst);
         return varInst;
     }
 
@@ -3204,6 +3307,7 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
             if (ptrType->hasAddressSpace())
                 storageClass = addressSpaceToStorageClass(ptrType->getAddressSpace());
         }
+
         auto varInst = emitOpVariable(
             getSection(SpvLogicalSectionID::GlobalVariables),
             globalVar,
@@ -3213,6 +3317,7 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         if (layout)
             emitVarLayout(globalVar, varInst, layout);
         emitDecorations(globalVar, getID(varInst));
+        maybeEmitDebugGlobalVariable(globalVar, varInst);
         return varInst;
     }
 
@@ -3225,6 +3330,7 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
             builder.getPtrType(
                 kIROp_PtrType,
                 spvAsmBuiltinVar->getDataType(),
+                AccessQualifier::ReadWrite,
                 AddressSpace::BuiltinInput),
             kind,
             spvAsmBuiltinVar);
@@ -3456,7 +3562,8 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                     spvBlock,
                     spvFunc,
                     irDebugFunc,
-                    irFunc->getDataType());
+                    irFunc->getDataType(),
+                    irFunc);
             }
             if (funcDebugScope)
             {
@@ -3471,7 +3578,7 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
             // all loops gets a header block.
             for (auto irInst : irBlock->getChildren())
             {
-                if (irInst->getOp() == kIROp_loop)
+                if (irInst->getOp() == kIROp_Loop)
                 {
                     emitOpLabel(spvFunc, irInst);
                 }
@@ -3533,9 +3640,9 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                 if (as<IRVar>(irInst))
                     continue;
                 emitLocalInst(spvBlock, irInst);
-                if (irInst->getOp() == kIROp_loop)
+                if (irInst->getOp() == kIROp_Loop)
                     pendingLoopInsts.add(as<IRLoop>(irInst));
-                if (irInst->getOp() == kIROp_discard && !shouldEmitDiscardAsDemote())
+                if (irInst->getOp() == kIROp_Discard && !shouldEmitDiscardAsDemote())
                 {
                     // If we emitted OpKill for discard, we should stop emitting anything
                     // after this inst in the block, because OpKill is a terminator inst.
@@ -3577,7 +3684,7 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
     {
         for (auto use = block->firstUse; use; use = use->nextUse)
         {
-            if (use->getUser()->getOp() == kIROp_loop &&
+            if (use->getUser()->getOp() == kIROp_Loop &&
                 as<IRLoop>(use->getUser())->getTargetBlock() == block)
             {
                 loopInst = use->getUser();
@@ -3724,7 +3831,7 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                     if (as<IRVectorType>(atomicInst->getDataType())->getElementType()->getOp() ==
                         kIROp_HalfType)
                     {
-                        ensureExtensionDeclaration(toSlice("VK_NV_shader_atomic_float16_vector"));
+                        ensureExtensionDeclaration(toSlice("SPV_NV_shader_atomic_fp16_vector"));
                         requireSPIRVCapability(SpvCapabilityAtomicFloat16VectorNV);
                     }
                     break;
@@ -3752,7 +3859,7 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                     if (as<IRVectorType>(atomicInst->getDataType())->getElementType()->getOp() ==
                         kIROp_HalfType)
                     {
-                        ensureExtensionDeclaration(toSlice("VK_NV_shader_atomic_float16_vector"));
+                        ensureExtensionDeclaration(toSlice("SPV_NV_shader_atomic_fp16_vector"));
                         requireSPIRVCapability(SpvCapabilityAtomicFloat16VectorNV);
                     }
                     break;
@@ -3821,20 +3928,24 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         return spvDebugLocalVar;
     }
 
-    bool isLegalType(IRInst* type)
+    // Returns true if the given type is allowed to emit for a `DebugVar`.
+    // Other types may not be illegal, but Slang currently does not support
+    // emitting these other DebugVar types.
+    bool isAllowedDebugVarType(IRInst* type)
     {
         switch (type->getOp())
         {
         case kIROp_UnsizedArrayType:
             return false;
         case kIROp_ArrayType:
-            return isLegalType(as<IRArrayType>(type)->getElementType());
+            return isAllowedDebugVarType(as<IRArrayType>(type)->getElementType());
         case kIROp_VectorType:
         case kIROp_StructType:
         case kIROp_MatrixType:
             return true;
         case kIROp_PtrType:
-            return as<IRPtrTypeBase>(type)->getAddressSpace() == AddressSpace::UserPointer;
+            return as<IRPtrTypeBase>(type)->getAddressSpace() == AddressSpace::UserPointer ||
+                   as<IRPtrTypeBase>(type)->getAddressSpace() == AddressSpace::GroupShared;
         default:
             if (as<IRBasicType>(type))
                 return true;
@@ -3852,7 +3963,7 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         builder.setInsertBefore(debugVar);
         auto varType = tryGetPointedToType(&builder, debugVar->getDataType());
 
-        if (!isLegalType(varType))
+        if (!isAllowedDebugVarType(varType))
             return nullptr;
 
         IRSizeAndAlignment sizeAlignment;
@@ -3862,10 +3973,44 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
             auto debugVarPtrType = builder.getPtrType(varType, AddressSpace::Function);
             auto actualHelperVar =
                 emitOpVariable(parent, debugVar, debugVarPtrType, SpvStorageClassFunction);
+            maybeEmitName(actualHelperVar, debugVar, toSlice("_dbgvar_"));
             maybeEmitPointerDecoration(actualHelperVar, debugVar);
             return actualHelperVar;
         }
         return nullptr;
+    }
+
+    void maybeEmitDebugGlobalVariable(IRInst* globalInst, SpvInst* spvVar)
+    {
+        auto scope = findDebugScope(globalInst->getModule()->getModuleInst());
+        if (!scope)
+            return;
+
+        auto name = getName(globalInst);
+        IRBuilder builder(globalInst);
+        auto varType = tryGetPointedToType(&builder, globalInst->getDataType());
+        auto debugType = emitDebugType(varType);
+
+        // Use default debug source and line info similar to struct debug type emission
+        auto loc = globalInst->findDecoration<IRDebugLocationDecoration>();
+        IRInst* source = loc ? loc->getSource() : m_defaultDebugSource;
+        IRInst* line = loc ? loc->getLine() : builder.getIntValue(builder.getUIntType(), 0);
+        IRInst* col = loc ? loc->getCol() : line;
+
+        emitOpDebugGlobalVariable(
+            getSection(SpvLogicalSectionID::GlobalVariables),
+            nullptr, // Don't associate with IR inst to avoid duplicate registration
+            m_voidType,
+            getNonSemanticDebugInfoExtInst(),
+            name,
+            debugType,
+            source,
+            line,
+            col,
+            scope,
+            name, // linkageName same as name
+            spvVar,
+            builder.getIntValue(builder.getUIntType(), 0)); // flags
     }
 
     SpvInst* emitMakeUInt64(SpvInstParent* parent, IRInst* inst)
@@ -3900,6 +4045,17 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         }
     }
 
+    SpvSelectionControlMask getSpvBranchSelectionControl(IRInst* inst)
+    {
+        if (inst->findDecorationImpl(kIROp_BranchDecoration))
+            return SpvSelectionControlDontFlattenMask;
+
+        if (inst->findDecorationImpl(kIROp_FlattenDecoration))
+            return SpvSelectionControlFlattenMask;
+
+        return SpvSelectionControlMaskNone;
+    }
+
     // The instructions that appear inside the basic blocks of
     // functions are what we will call "local" instructions.
     //
@@ -3919,7 +4075,9 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                 if (as<IRSPIRVAsmOperand>(inst))
                     return nullptr;
                 String e = "Unhandled local inst in spirv-emit:\n" +
-                           dumpIRToString(inst, {IRDumpOptions::Mode::Detailed, 0});
+                           dumpIRToString(
+                               inst,
+                               {IRDumpOptions::Mode::Detailed, IRDumpOptions::Flag::DumpDebugIds});
                 SLANG_UNIMPLEMENTED_X(e.getBuffer());
             }
         case kIROp_Specialize:
@@ -3945,6 +4103,9 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         case kIROp_GetOffsetPtr:
             result = emitGetOffsetPtr(parent, inst);
             break;
+        case kIROp_MeshOutputRef:
+            result = emitMeshOutputRef(parent, inst);
+            break;
         case kIROp_GetElement:
             result = emitGetElement(parent, as<IRGetElement>(inst));
             break;
@@ -3969,7 +4130,7 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         case kIROp_SwizzledStore:
             result = emitSwizzledStore(parent, as<IRSwizzledStore>(inst));
             break;
-        case kIROp_swizzleSet:
+        case kIROp_SwizzleSet:
             result = emitSwizzleSet(parent, as<IRSwizzleSet>(inst));
             break;
         case kIROp_RWStructuredBufferGetElementPtr:
@@ -3982,7 +4143,7 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         case kIROp_GetUntypedBufferPtr:
             result = emitGetBufferPtr(parent, inst);
             break;
-        case kIROp_swizzle:
+        case kIROp_Swizzle:
             result = emitSwizzle(parent, as<IRSwizzle>(inst));
             break;
         case kIROp_IntCast:
@@ -4046,10 +4207,57 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         case kIROp_CastDescriptorHandleToUInt2:
         case kIROp_CastUInt2ToDescriptorHandle:
         case kIROp_GlobalValueRef:
+        case kIROp_CastUInt64ToDescriptorHandle:
+        case kIROp_CastDescriptorHandleToUInt64:
             {
                 auto inner = ensureInst(inst->getOperand(0));
                 registerInst(inst, inner);
                 result = inner;
+                break;
+            }
+        case kIROp_CastDescriptorHandleToResource:
+            // Convert DescriptorHandle (uint64_t handle) to appropriate resource type
+            {
+                auto targetCaps = m_targetProgram->getTargetReq()->getTargetCaps();
+
+                if (targetCaps.implies(CapabilityAtom::spvBindlessTextureNV))
+                {
+                    requireSPIRVCapability((SpvCapability)SpvCapabilityBindlessTextureNV);
+                    ensureExtensionDeclaration(UnownedStringSlice("SPV_NV_bindless_texture"));
+
+                    auto operand = ensureInst(inst->getOperand(0));
+                    SpvOp conversionOp = SpvOpConvertUToSampledImageNV;
+                    IRType* resultType = inst->getDataType();
+
+                    switch (resultType->getOp())
+                    {
+                    case kIROp_TextureType:
+                        conversionOp = SpvOpConvertUToSampledImageNV;
+                        result = emitInst(
+                            parent,
+                            inst,
+                            conversionOp,
+                            inst->getDataType(),
+                            kResultID,
+                            operand);
+                        break;
+                    case kIROp_SamplerStateType:
+                        conversionOp = SpvOpConvertUToSamplerNV;
+                        result = emitInst(
+                            parent,
+                            inst,
+                            conversionOp,
+                            inst->getDataType(),
+                            kResultID,
+                            operand);
+                        break;
+                    default:
+                        // Unsupported result type for descriptor-to-resource conversion
+                        SLANG_UNEXPECTED(
+                            "Unsupported result type for CastDescriptorHandleToResource");
+                        break;
+                    }
+                }
                 break;
             }
         case kIROp_GetVulkanRayTracingPayloadLocation:
@@ -4090,8 +4298,7 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
 
                     ensureExtensionDeclaration(
                         UnownedStringSlice("SPV_KHR_compute_shader_derivatives"));
-                    auto numThreadsDecor =
-                        entryPointDecor->findDecoration<IRNumThreadsDecoration>();
+                    auto numThreadsDecor = entryPoint->findDecoration<IRNumThreadsDecoration>();
                     if (isQuad)
                     {
                         verifyComputeDerivativeGroupModifiers(
@@ -4146,7 +4353,7 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
             else
                 result = emitOpReturnValue(parent, inst, as<IRReturn>(inst)->getVal());
             break;
-        case kIROp_discard:
+        case kIROp_Discard:
             if (shouldEmitDiscardAsDemote())
             {
                 ensureExtensionDeclarationBeforeSpv16(
@@ -4171,7 +4378,7 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         case kIROp_EndFragmentShaderInterlock:
             result = emitOpEndInvocationInterlockEXT(parent, inst);
             break;
-        case kIROp_unconditionalBranch:
+        case kIROp_UnconditionalBranch:
             {
                 // If we are jumping to the main block of a loop,
                 // emit a branch to the loop header instead.
@@ -4184,7 +4391,7 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                 result = emitOpBranch(parent, inst, getIRInstSpvID(targetBlock));
                 break;
             }
-        case kIROp_loop:
+        case kIROp_Loop:
             {
                 // Return loop header block in its own block.
                 auto blockId = getIRInstSpvID(inst);
@@ -4201,11 +4408,15 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                 result = block;
                 break;
             }
-        case kIROp_ifElse:
+        case kIROp_IfElse:
             {
                 auto ifelseInst = as<IRIfElse>(inst);
                 auto afterBlockID = getIRInstSpvID(ifelseInst->getAfterBlock());
-                emitOpSelectionMerge(parent, nullptr, afterBlockID, SpvSelectionControlMaskNone);
+                emitOpSelectionMerge(
+                    parent,
+                    nullptr,
+                    afterBlockID,
+                    getSpvBranchSelectionControl(ifelseInst));
                 auto falseLabel = ifelseInst->getFalseBlock();
                 result = emitOpBranchConditional(
                     parent,
@@ -4220,7 +4431,11 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
             {
                 auto switchInst = as<IRSwitch>(inst);
                 auto mergeBlockID = getIRInstSpvID(switchInst->getBreakLabel());
-                emitOpSelectionMerge(parent, nullptr, mergeBlockID, SpvSelectionControlMaskNone);
+                emitOpSelectionMerge(
+                    parent,
+                    nullptr,
+                    mergeBlockID,
+                    getSpvBranchSelectionControl(switchInst));
                 result = emitInstCustomOperandFunc(
                     parent,
                     inst,
@@ -4245,7 +4460,7 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         case kIROp_Unreachable:
             result = emitOpUnreachable(parent, inst);
             break;
-        case kIROp_conditionalBranch:
+        case kIROp_ConditionalBranch:
             SLANG_UNEXPECTED("Unstructured branching is not supported by SPIRV.");
             break;
         case kIROp_MakeVector:
@@ -4297,7 +4512,8 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         case kIROp_GetStringHash:
             result = emitGetStringHash(inst);
             break;
-        case kIROp_undefined:
+        case kIROp_LoadFromUninitializedMemory:
+        case kIROp_Poison:
             result = emitOpUndef(parent, inst, inst->getDataType());
             break;
         case kIROp_SPIRVAsm:
@@ -4354,33 +4570,37 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
             break;
         case kIROp_AtomicLoad:
             {
-                IRBuilder builder{inst};
-                if (isAtomicableAddressSpace(inst->getOperand(0)->getDataType()))
+                IRAtomicLoad* atomicLoad = as<IRAtomicLoad>(inst);
+                auto ptr = atomicLoad->getPtr();
+                IRBuilder builder{atomicLoad};
+                if (isAtomicableAddressSpace(ptr->getDataType()))
                 {
                     if (m_memoryModel == SpvMemoryModelVulkan)
                         requireSPIRVCapability(SpvCapabilityVulkanMemoryModelDeviceScope);
 
                     const auto memoryScope =
                         emitIntConstant(IRIntegerValue{SpvScopeDevice}, builder.getUIntType());
-                    const auto memorySemantics =
-                        emitMemorySemanticMask(inst->getOperand(1), inst->getOperand(0));
+                    const auto memorySemantics = emitMemorySemanticMask(inst->getOperand(1), ptr);
                     result = emitOpAtomicLoad(
                         parent,
                         inst,
                         inst->getFullType(),
-                        inst->getOperand(0),
+                        ptr,
                         memoryScope,
                         memorySemantics);
                     ensureAtomicCapability(inst, SpvOpAtomicLoad);
                 }
                 else
                 {
-                    result = emitLoadMaybeCoherent(parent, inst);
+                    result = emitLoad(parent, inst, ptr);
                 }
             }
             break;
         case kIROp_AtomicStore:
             {
+                IRAtomicStore* atomicStore = as<IRAtomicStore>(inst);
+                auto ptr = atomicStore->getPtr();
+                auto val = atomicStore->getVal();
                 IRBuilder builder{inst};
                 if (isAtomicableAddressSpace(inst->getOperand(0)->getDataType()))
                 {
@@ -4389,48 +4609,44 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
 
                     const auto memoryScope =
                         emitIntConstant(IRIntegerValue{SpvScopeDevice}, builder.getUIntType());
-                    const auto memorySemantics =
-                        emitMemorySemanticMask(inst->getOperand(2), inst->getOperand(0));
-                    result = emitOpAtomicStore(
-                        parent,
-                        inst,
-                        inst->getOperand(0),
-                        memoryScope,
-                        memorySemantics,
-                        inst->getOperand(1));
+                    const auto memorySemantics = emitMemorySemanticMask(inst->getOperand(2), ptr);
+                    result =
+                        emitOpAtomicStore(parent, inst, ptr, memoryScope, memorySemantics, val);
                     ensureAtomicCapability(inst, SpvOpAtomicStore);
                 }
                 else
                 {
-                    result = emitStoreMaybeCoherent(parent, inst);
+                    result = emitStore(parent, inst, ptr, val);
                 }
             }
             break;
         case kIROp_AtomicExchange:
             {
+                IRAtomicExchange* atomicExchange = as<IRAtomicExchange>(inst);
+                auto ptr = atomicExchange->getPtr();
+                auto val = atomicExchange->getOperand(1);
                 IRBuilder builder{inst};
-                if (isAtomicableAddressSpace(inst->getOperand(0)->getDataType()))
+                if (isAtomicableAddressSpace(ptr->getDataType()))
                 {
                     if (m_memoryModel == SpvMemoryModelVulkan)
                         requireSPIRVCapability(SpvCapabilityVulkanMemoryModelDeviceScope);
 
                     const auto memoryScope =
                         emitIntConstant(IRIntegerValue{SpvScopeDevice}, builder.getUIntType());
-                    const auto memorySemantics =
-                        emitMemorySemanticMask(inst->getOperand(2), inst->getOperand(0));
+                    const auto memorySemantics = emitMemorySemanticMask(inst->getOperand(2), ptr);
                     result = emitOpAtomicExchange(
                         parent,
                         inst,
                         inst->getFullType(),
-                        inst->getOperand(0),
+                        ptr,
                         memoryScope,
                         memorySemantics,
-                        inst->getOperand(1));
+                        val);
                     ensureAtomicCapability(inst, SpvOpAtomicExchange);
                 }
                 else
                 {
-                    result = emitStoreMaybeCoherent(parent, inst);
+                    result = emitStore(parent, inst, ptr, val);
                 }
             }
             break;
@@ -4658,7 +4874,8 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
             kResultID,
             subscript->getImage(),
             subscript->getCoord(),
-            builder.getIntValue(builder.getIntType(), 0));
+            subscript->hasSampleCoord() ? subscript->getSampleCoord()
+                                        : builder.getIntValue(builder.getIntType(), 0));
     }
 
     SpvInst* emitGetStringHash(IRInst* inst)
@@ -4677,7 +4894,9 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         {
             // Couldn't handle
             String e = "Unhandled local inst in spirv-emit:\n" +
-                       dumpIRToString(inst, {IRDumpOptions::Mode::Detailed, 0});
+                       dumpIRToString(
+                           inst,
+                           {IRDumpOptions::Mode::Detailed, IRDumpOptions::Flag::DumpDebugIds});
             SLANG_UNIMPLEMENTED_X(e.getBuffer());
         }
     }
@@ -4838,7 +5057,15 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         if (mode == SpvExecutionModeMax)
             return;
 
-        requireSPIRVExecutionMode(nullptr, getIRInstSpvID(entryPoint), mode);
+        // Vulkan spec requires DepthReplacing exec mode when storing to FragDepth,
+        // in addition to DepthLess/DepthGreater modes.
+        requireSPIRVExecutionMode(
+            nullptr,
+            getIRInstSpvID(entryPoint),
+            SpvExecutionModeDepthReplacing);
+
+        if (mode != SpvExecutionModeDepthReplacing)
+            requireSPIRVExecutionMode(nullptr, getIRInstSpvID(entryPoint), mode);
     }
 
     // Make user type name conform to `SPV_GOOGLE_user_type` spec.
@@ -5089,6 +5316,42 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                 }
             }
             break;
+        case kIROp_FpDenormalPreserveDecoration:
+            {
+                auto fpDenormalDecor = cast<IRFpDenormalPreserveDecoration>(decoration);
+                auto width = int32_t(getIntVal(fpDenormalDecor->getWidth()));
+                ensureExtensionDeclaration(UnownedStringSlice("SPV_KHR_float_controls"));
+                requireSPIRVCapability(SpvCapabilityDenormPreserve);
+                // emitInst is used instead of requireSPIRVExecutionMode because
+                // we need to be able to emit the same execution mode with different
+                // operands for different widths
+                emitInst(
+                    getSection(SpvLogicalSectionID::ExecutionModes),
+                    decoration,
+                    SpvOpExecutionMode,
+                    dstID,
+                    SpvExecutionModeDenormPreserve,
+                    SpvLiteralInteger::from32(width));
+            }
+            break;
+        case kIROp_FpDenormalFlushToZeroDecoration:
+            {
+                auto fpDenormalDecor = cast<IRFpDenormalFlushToZeroDecoration>(decoration);
+                auto width = int32_t(getIntVal(fpDenormalDecor->getWidth()));
+                ensureExtensionDeclaration(UnownedStringSlice("SPV_KHR_float_controls"));
+                requireSPIRVCapability(SpvCapabilityDenormFlushToZero);
+                // emitInst is used instead of requireSPIRVExecutionMode because
+                // we need to be able to emit the same execution mode with different
+                // operands for different widths
+                emitInst(
+                    getSection(SpvLogicalSectionID::ExecutionModes),
+                    decoration,
+                    SpvOpExecutionMode,
+                    dstID,
+                    SpvExecutionModeDenormFlushToZero,
+                    SpvLiteralInteger::from32(width));
+            }
+            break;
         case kIROp_MaxVertexCountDecoration:
             // Don't do anything here, instead wait until we see OutputTopologyDecoration
             // and emit them together to ensure MaxVertexCount always appears before
@@ -5242,6 +5505,8 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                             m = SpvExecutionModeVertexOrderCw;
                         else if (topologyType == OutputTopologyType::TriangleCCW)
                             m = SpvExecutionModeVertexOrderCcw;
+                        else if (topologyType == OutputTopologyType::Point)
+                            m = SpvExecutionModePointMode;
                         break;
                     }
                 }
@@ -5618,7 +5883,10 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
             }
 
             if (!isPhysicalType)
+            {
+                id++;
                 continue;
+            }
 
             // Emit explicit struct field layout decorations if the struct is physical.
             IRIntegerValue offset = 0;
@@ -5992,6 +6260,12 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                     requireSPIRVCapability(SpvCapabilityDrawParameters);
                     return getBuiltinGlobalVar(inst->getFullType(), SpvBuiltInDrawIndex, inst);
                 }
+                else if (semanticName == "sv_deviceindex")
+                {
+                    ensureExtensionDeclaration(UnownedStringSlice("SPV_KHR_device_group"));
+                    requireSPIRVCapability(SpvCapabilityDeviceGroup);
+                    return getBuiltinGlobalVar(inst->getFullType(), SpvBuiltInDeviceIndex, inst);
+                }
                 else if (semanticName == "sv_primitiveid")
                 {
                     auto entryPoints = m_referencingEntryPoints.tryGetValue(inst);
@@ -6041,6 +6315,11 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                     requireSPIRVCapability(SpvCapabilitySampleRateShading);
                     return getBuiltinGlobalVar(inst->getFullType(), SpvBuiltInSampleId, inst);
                 }
+                else if (semanticName == "sv_vulkansampleposition")
+                {
+                    requireSPIRVCapability(SpvCapabilitySampleRateShading);
+                    return getBuiltinGlobalVar(inst->getFullType(), SpvBuiltInSamplePosition, inst);
+                }
                 else if (semanticName == "sv_stencilref")
                 {
                     requireSPIRVCapability(SpvCapabilityStencilExportEXT);
@@ -6080,23 +6359,33 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                 }
                 else if (semanticName == "nv_viewport_mask")
                 {
-                    requireSPIRVCapability(SpvCapabilityPerViewAttributesNV);
-                    ensureExtensionDeclaration(UnownedStringSlice("SPV_NV_mesh_shader"));
-                    return getBuiltinGlobalVar(
-                        inst->getFullType(),
-                        SpvBuiltInViewportMaskPerViewNV,
-                        inst);
+                    requireSPIRVCapability(SpvCapabilityShaderViewportMaskNV);
+                    ensureExtensionDeclaration(UnownedStringSlice("SPV_NV_viewport_array2"));
+                    return getBuiltinGlobalVar(inst->getFullType(), SpvBuiltInViewportMaskNV, inst);
                 }
                 else if (semanticName == "sv_barycentrics")
                 {
                     requireSPIRVCapability(SpvCapabilityFragmentBarycentricKHR);
                     ensureExtensionDeclaration(
                         UnownedStringSlice("SPV_KHR_fragment_shader_barycentric"));
-                    return getBuiltinGlobalVar(inst->getFullType(), SpvBuiltInBaryCoordKHR, inst);
 
-                    // TODO: There is also the `gl_BaryCoordNoPerspNV` builtin, which
-                    // we ought to use if the `noperspective` modifier has been
-                    // applied to this varying input.
+                    auto interpolationModeDecor =
+                        inst->findDecoration<IRInterpolationModeDecoration>();
+                    if (interpolationModeDecor &&
+                        interpolationModeDecor->getMode() == IRInterpolationMode::NoPerspective)
+                    {
+                        return getBuiltinGlobalVar(
+                            inst->getFullType(),
+                            SpvBuiltInBaryCoordNoPerspKHR,
+                            inst);
+                    }
+                    else
+                    {
+                        return getBuiltinGlobalVar(
+                            inst->getFullType(),
+                            SpvBuiltInBaryCoordKHR,
+                            inst);
+                    }
                 }
                 else if (semanticName == "sv_cullprimitive")
                 {
@@ -6105,6 +6394,23 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                     return getBuiltinGlobalVar(
                         inst->getFullType(),
                         SpvBuiltInCullPrimitiveEXT,
+                        inst);
+                }
+                else if (semanticName == "sv_fragsize")
+                {
+                    requireSPIRVCapability(SpvCapabilityFragmentDensityEXT);
+                    ensureExtensionDeclaration(
+                        UnownedStringSlice("SPV_EXT_fragment_invocation_density"));
+                    return getBuiltinGlobalVar(inst->getFullType(), SpvBuiltInFragSizeEXT, inst);
+                }
+                else if (semanticName == "sv_fraginvocationcount")
+                {
+                    requireSPIRVCapability(SpvCapabilityFragmentDensityEXT);
+                    ensureExtensionDeclaration(
+                        UnownedStringSlice("SPV_EXT_fragment_invocation_density"));
+                    return getBuiltinGlobalVar(
+                        inst->getFullType(),
+                        SpvBuiltInFragInvocationCountEXT,
                         inst);
                 }
                 else if (semanticName == "sv_shadingrate")
@@ -6175,12 +6481,19 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
             SpvStorageClassPhysicalStorageBuffer)
         {
             // If inst has a pointer type with PhysicalStorageBuffer address space,
-            // emit AliasedPointer decoration.
-            emitOpDecorate(
-                getSection(SpvLogicalSectionID::Annotations),
-                nullptr,
-                varInst,
-                (isVar ? SpvDecorationAliasedPointer : SpvDecorationAliased));
+            // emit AliasedPointer or RestrictPointer decoration.
+            SpvDecoration decor;
+            if (ptrType->getAccessQualifier() == AccessQualifier::Immutable)
+            {
+                // We can always safely use RestrictPointer for immutable pointers.
+                // This will allow better optimization.
+                decor = isVar ? SpvDecorationRestrictPointer : SpvDecorationRestrict;
+            }
+            else
+            {
+                decor = isVar ? SpvDecorationAliasedPointer : SpvDecorationAliased;
+            }
+            emitOpDecorate(getSection(SpvLogicalSectionID::Annotations), nullptr, varInst, decor);
         }
         else
         {
@@ -6396,10 +6709,10 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                     UInt argStartIndex = 0;
                     switch (branchInst->getOp())
                     {
-                    case kIROp_unconditionalBranch:
+                    case kIROp_UnconditionalBranch:
                         argStartIndex = 1;
                         break;
-                    case kIROp_loop:
+                    case kIROp_Loop:
                         argStartIndex = 3;
                         break;
                     default:
@@ -6735,15 +7048,14 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         {
             baseStructType = as<IRStructType>(ptrType->getValueType());
             baseId = getID(ensureInst(base));
+            SLANG_ASSERT(
+                as<IRPtrTypeBase>(fieldAddress->getFullType())->getAddressSpace() ==
+                    ptrType->getAddressSpace() &&
+                "field_address requires base and result to have same address space.");
         }
         else
         {
-            baseStructType = as<IRStructType>(base->getDataType());
-
-            auto structPtrType = builder.getPtrType(baseStructType);
-            auto varInst = emitOpVariable(parent, nullptr, structPtrType, SpvStorageClassFunction);
-            emitOpStore(parent, nullptr, varInst, base);
-            baseId = getID(varInst);
+            SLANG_UNEXPECTED("field_address requires base to be an address.");
         }
         SLANG_ASSERT(baseStructType && "field_address requires base to be a struct.");
         auto fieldId = emitIntConstant(
@@ -6778,6 +7090,8 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
 
     SpvInst* emitGetOffsetPtr(SpvInstParent* parent, IRInst* inst)
     {
+        requireVariableBufferCapabilityIfNeeded(inst->getDataType());
+
         return emitOpPtrAccessChain(
             parent,
             inst,
@@ -6795,7 +7109,6 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         // We might replace resultType with a different storage class equivalent
         auto resultType = as<IRPtrTypeBase>(inst->getDataType());
         SLANG_ASSERT(resultType);
-
         if (const auto basePtrType = as<IRPtrTypeBase>(base->getDataType()))
         {
             // If the base pointer has a specific address space and the
@@ -6817,6 +7130,19 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
             inst->getFullType(),
             baseId,
             makeArray(inst->getIndex()));
+    }
+
+    SpvInst* emitMeshOutputRef(SpvInstParent* parent, IRInst* inst)
+    {
+        // MeshOutputRef takes two operands: the mesh output array and the index
+        // It should return a reference (address) to the element at that index
+        auto base = inst->getOperand(0);
+        auto index = inst->getOperand(1);
+
+        const SpvWord baseId = getID(ensureInst(base));
+
+        // Use OpAccessChain to get the address of the element
+        return emitOpAccessChain(parent, inst, inst->getFullType(), baseId, makeArray(index));
     }
 
     SpvInst* emitGetElement(SpvInstParent* parent, IRGetElement* inst)
@@ -6858,54 +7184,100 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         }
     }
 
-    SpvInst* emitLoad(SpvInstParent* parent, IRLoad* inst)
+    enum class MemoryAccessType
     {
-        requireVariableBufferCapabilityIfNeeded(inst->getDataType());
+        Load,
+        Store
+    };
 
-        auto ptrType = as<IRPtrTypeBase>(inst->getPtr()->getDataType());
-        if (ptrType && addressSpaceToStorageClass(ptrType->getAddressSpace()) ==
-                           SpvStorageClassPhysicalStorageBuffer)
+    template<MemoryAccessType memoryAccessType>
+    void getMemoryAccessOperandsOfLoadStore(
+        IRInst* inst,
+        IRInst* ptr,
+        int& memoryAccessMaskOut,
+        int& alignmentOut,
+        MemoryScope& memoryScopeOut)
+    {
+        IRAlignedAttr* alignedAttr = nullptr;
+        IRMemoryScopeAttr* memoryScopeAttr = nullptr;
+
+        for (auto attr : inst->getAllAttrs())
         {
-            IRSizeAndAlignment sizeAndAlignment;
-            if (auto alignedAttr = inst->findAttr<IRAlignedAttr>())
+            if (auto foundAlignedAttr = as<IRAlignedAttr>(attr))
+                alignedAttr = foundAlignedAttr;
+            else if (auto foundMemoryScopeAttr = as<IRMemoryScopeAttr>(attr))
+                memoryScopeAttr = foundMemoryScopeAttr;
+        }
+
+        // Determine coherence
+        {
+            bool isCoherent = false;
+            if (memoryScopeAttr)
             {
-                sizeAndAlignment.alignment = (int)getIntVal(alignedAttr->getAlignment());
+                memoryScopeOut = (MemoryScope)getIntVal(memoryScopeAttr->getMemoryScope());
+                if (m_memoryModel != SpvMemoryModelVulkan)
+                    SLANG_ASSERT_FAILURE(
+                        "Explicit coherent operations require vulkan-memory-model, "
+                        "specify the capability 'vk_mem_model'");
+                isCoherent = true;
             }
             else
             {
-                getNaturalSizeAndAlignment(
-                    m_targetProgram->getOptionSet(),
-                    ptrType->getValueType(),
-                    &sizeAndAlignment);
+                if (NeedToUseCoherentLoadOrStore(ptr))
+                {
+                    memoryScopeOut = MemoryScope::Device;
+                    isCoherent = true;
+                }
             }
-            return emitOpLoadAligned(
-                parent,
-                inst,
-                inst->getDataType(),
-                inst->getPtr(),
-                SpvLiteralInteger::from32(sizeAndAlignment.alignment));
+            if (isCoherent)
+            {
+
+                memoryAccessMaskOut |= SpvMemoryAccessNonPrivatePointerMask;
+                if constexpr (memoryAccessType == MemoryAccessType::Load)
+                    memoryAccessMaskOut |= SpvMemoryAccessMakePointerVisibleMask;
+                else
+                    memoryAccessMaskOut |= SpvMemoryAccessMakePointerAvailableMask;
+                if (memoryScopeOut == MemoryScope::Device)
+                    requireSPIRVCapability(SpvCapabilityVulkanMemoryModelDeviceScope);
+            }
         }
-        else
+
+        // Determine alignment
         {
-            return emitLoadMaybeCoherent(parent, inst);
+            auto ptrType = as<IRPtrTypeBase>(ptr->getDataType());
+            if (ptrType && addressSpaceToStorageClass(ptrType->getAddressSpace()) ==
+                               SpvStorageClassPhysicalStorageBuffer)
+            {
+                IRSizeAndAlignment sizeAndAlignment;
+                if (alignedAttr)
+                    sizeAndAlignment.alignment = (int)getIntVal(alignedAttr->getAlignment());
+                else
+                    getNaturalSizeAndAlignment(
+                        m_targetProgram->getOptionSet(),
+                        ptrType->getValueType(),
+                        &sizeAndAlignment);
+
+                alignmentOut = sizeAndAlignment.alignment;
+                if (alignmentOut != -1)
+                    memoryAccessMaskOut |= SpvMemoryAccessAlignedMask;
+            }
         }
     }
 
-    SpvInst* emitLoadMaybeCoherent(SpvInstParent* parent, IRInst* inst)
+    SpvInst* emitLoad(SpvInstParent* parent, IRInst* inst, IRInst* ptr)
     {
-        IRBuilder builder{inst};
-        builder.setInsertBefore(inst);
+        requireVariableBufferCapabilityIfNeeded(inst->getDataType());
 
-        SpvInst* deviceScope = nullptr;
-        IRInst* pointer = inst->getOperand(0);
-
-        bool coherentPointer = NeedToUseCoherentLoadOrStore(pointer);
-        if (coherentPointer)
-        {
-            requireSPIRVCapability(SpvCapabilityVulkanMemoryModelDeviceScope);
-            deviceScope = emitIntConstant(IRIntegerValue{SpvScopeDevice}, builder.getUIntType());
-        }
-
+        IRBuilder builder(inst);
+        int memoryAccessMask = 0;
+        int alignment = -1;
+        MemoryScope memoryScope{};
+        getMemoryAccessOperandsOfLoadStore<MemoryAccessType::Load>(
+            inst,
+            ptr,
+            memoryAccessMask,
+            alignment,
+            memoryScope);
         return emitInstCustomOperandFunc(
             parent,
             inst,
@@ -6914,84 +7286,60 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
             {
                 emitOperand(inst->getFullType());
                 emitOperand(kResultID);
-                emitOperand(pointer);
-
-                if (coherentPointer)
+                emitOperand(ptr);
+                if (memoryAccessMask)
                 {
-                    emitOperand(
-                        SpvMemoryAccessMakePointerVisibleMask |
-                        SpvMemoryAccessNonPrivatePointerMask);
-
-                    emitOperand(deviceScope);
+                    emitOperand(SpvLiteralInteger::from32(memoryAccessMask));
+                    if (memoryAccessMask & SpvMemoryAccessAlignedMask)
+                        emitOperand(SpvLiteralInteger::from32((uint32_t)alignment));
+                    if (memoryAccessMask & SpvMemoryAccessMakePointerVisibleMask)
+                        emitOperand(
+                            emitIntConstant((IRIntegerValue)memoryScope, builder.getIntType()));
                 }
             });
     }
 
-    SpvInst* emitStore(SpvInstParent* parent, IRStore* inst)
+    SpvInst* emitLoad(SpvInstParent* parent, IRLoad* inst)
     {
-        auto ptrType = as<IRPtrTypeBase>(inst->getPtr()->getDataType());
-        if (ptrType && addressSpaceToStorageClass(ptrType->getAddressSpace()) ==
-                           SpvStorageClassPhysicalStorageBuffer)
-        {
-            IRSizeAndAlignment sizeAndAlignment;
-            if (auto alignedAttr = inst->findAttr<IRAlignedAttr>())
-            {
-                sizeAndAlignment.alignment = (int)getIntVal(alignedAttr->getAlignment());
-            }
-            else
-            {
-                getNaturalSizeAndAlignment(
-                    m_targetProgram->getOptionSet(),
-                    ptrType->getValueType(),
-                    &sizeAndAlignment);
-            }
-            return emitOpStoreAligned(
-                parent,
-                inst,
-                inst->getPtr(),
-                inst->getVal(),
-                SpvLiteralInteger::from32(sizeAndAlignment.alignment));
-        }
-        else
-        {
-            return emitStoreMaybeCoherent(parent, inst);
-        }
+        return emitLoad(parent, inst, inst->getPtr());
     }
 
-    SpvInst* emitStoreMaybeCoherent(SpvInstParent* parent, IRInst* inst)
+    SpvInst* emitStore(SpvInstParent* parent, IRInst* inst, IRInst* ptr, IRInst* val)
     {
-        IRBuilder builder{inst};
-        builder.setInsertBefore(inst);
+        requireVariableBufferCapabilityIfNeeded(inst->getDataType());
 
-        SpvInst* deviceScope = nullptr;
-        IRInst* pointer = inst->getOperand(0);
-        IRInst* object = inst->getOperand(1);
-
-        bool coherentPointer = NeedToUseCoherentLoadOrStore(pointer);
-        if (coherentPointer)
-        {
-            requireSPIRVCapability(SpvCapabilityVulkanMemoryModelDeviceScope);
-            deviceScope = emitIntConstant(IRIntegerValue{SpvScopeDevice}, builder.getUIntType());
-        }
-
+        IRBuilder builder(inst);
+        int memoryAccessMask = 0;
+        int alignment = -1;
+        MemoryScope memoryScope{};
+        getMemoryAccessOperandsOfLoadStore<MemoryAccessType::Store>(
+            inst,
+            ptr,
+            memoryAccessMask,
+            alignment,
+            memoryScope);
         return emitInstCustomOperandFunc(
             parent,
             inst,
             SpvOpStore,
             [&]()
             {
-                emitOperand(pointer);
-                emitOperand(object);
-
-                if (coherentPointer)
+                emitOperand(ptr);
+                emitOperand(val);
+                if (memoryAccessMask)
                 {
-                    emitOperand(
-                        SpvMemoryAccessMakePointerAvailableMask |
-                        SpvMemoryAccessNonPrivatePointerMask);
-
-                    emitOperand(deviceScope);
+                    emitOperand(SpvLiteralInteger::from32(memoryAccessMask));
+                    if (memoryAccessMask & SpvMemoryAccessAlignedMask)
+                        emitOperand(SpvLiteralInteger::from32((uint32_t)alignment));
+                    if (memoryAccessMask & SpvMemoryAccessMakePointerAvailableMask)
+                        emitOperand(
+                            emitIntConstant((IRIntegerValue)memoryScope, builder.getIntType()));
                 }
             });
+    }
+    SpvInst* emitStore(SpvInstParent* parent, IRStore* inst)
+    {
+        return emitStore(parent, inst, inst->getPtr(), inst->getVal());
     }
 
     SpvInst* emitSwizzledStore(SpvInstParent* parent, IRSwizzledStore* inst)
@@ -7263,6 +7611,12 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
 
         SLANG_ASSERT(isIntegralType(fromType));
         SLANG_ASSERT(isIntegralType(toType));
+        if (isTypeEqual(fromType, toType))
+        {
+            auto inner = ensureInst(inst->getOperand(0));
+            registerInst(inst, inner);
+            return inner;
+        }
 
         const auto fromInfo = getIntTypeInfo(fromType);
         const auto toInfo = getIntTypeInfo(toType);
@@ -7288,11 +7642,9 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
             // Perform unsigned conversion first to an unsigned integer of the same width as the
             // result then perform bit cast to the signed result type. This is done because SPIRV's
             // unsigned conversion (`OpUConvert`) requires result type to be unsigned.
-            auto unsignedV = emitOpUConvert(
-                parent,
-                nullptr,
-                builder.getType(getOppositeSignIntTypeOp(toType->getOp())),
-                inst->getOperand(0));
+            auto builderType = getUnsignedTypeFromSignedType(&builder, toTypeV);
+
+            auto unsignedV = emitOpUConvert(parent, nullptr, builderType, inst->getOperand(0));
             return emitOpBitcast(parent, inst, toTypeV, unsignedV);
         }
         else if (fromInfo.isSigned)
@@ -7382,7 +7734,12 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
 
         SLANG_ASSERT(isFloatingType(fromType));
         SLANG_ASSERT(isFloatingType(toType));
-        SLANG_ASSERT(!isTypeEqual(fromType, toType));
+        if (isTypeEqual(fromType, toType))
+        {
+            auto inner = ensureInst(inst->getOperand(0));
+            registerInst(inst, inner);
+            return inner;
+        }
 
         if (isMatrixCast)
         {
@@ -7647,7 +8004,7 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         // Otherwise, operands are raw elements, we need to construct row vectors first,
         // then construct matrix from row vectors.
         List<SpvInst*> rowVectors;
-        auto matrixType = as<IRMatrixType>(inst->getDataType());
+        auto matrixType = cast<IRMatrixType>(inst->getDataType());
         auto rowCount = getIntVal(matrixType->getRowCount());
         auto colCount = getIntVal(matrixType->getColumnCount());
         IRBuilder builder(inst);
@@ -7751,27 +8108,6 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
             List<IRInst*>::makeRepeated(scalar, Index(numElems)));
     }
 
-    bool isSignedType(IRType* type)
-    {
-        switch (type->getOp())
-        {
-        case kIROp_FloatType:
-        case kIROp_DoubleType:
-            return true;
-        case kIROp_IntType:
-        case kIROp_Int16Type:
-        case kIROp_Int64Type:
-        case kIROp_Int8Type:
-            return true;
-        case kIROp_VectorType:
-            return isSignedType(as<IRVectorType>(type)->getElementType());
-        case kIROp_MatrixType:
-            return isSignedType(as<IRMatrixType>(type)->getElementType());
-        default:
-            return false;
-        }
-    }
-
     bool isFloatType(IRInst* type)
     {
         switch (type->getOp())
@@ -7786,6 +8122,191 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
             return isFloatType(as<IRMatrixType>(type)->getElementType());
         default:
             return false;
+        }
+    }
+
+    // Type and constants used by checkTypeNeedsStorageCapability
+    typedef uint32_t TypeNeedsStorageFlags;
+    struct TypeNeedsStorageFlag
+    {
+        enum Enum : TypeNeedsStorageFlags
+        {
+            kNone = 0,
+            kElementSize8 = 1 << 0,
+            kElementSize16 = 1 << 1,
+        };
+    };
+
+    // Helper function to recursively check if a storage type contains 8/16-bit types.
+    // Returns true if all requested targets have been found and therefore it can stop
+    // recursing.
+    bool checkTypeNeedsStorageCapability(
+        IRType* type,
+        const TypeNeedsStorageFlags targets,
+        TypeNeedsStorageFlags& found,
+        HashSet<IRType*>& visited)
+    {
+        if (visited.contains(type))
+            return false; // Cycle detected, break recursion
+
+        visited.add(type);
+
+        switch (type->getOp())
+        {
+        case kIROp_HalfType:
+        case kIROp_UInt16Type:
+        case kIROp_Int16Type:
+            found |= TypeNeedsStorageFlag::kElementSize16;
+            return (targets == (found & targets));
+
+        case kIROp_UInt8Type:
+        case kIROp_Int8Type:
+            found |= TypeNeedsStorageFlag::kElementSize8;
+            return (targets == (found & targets));
+
+        case kIROp_VectorType:
+            if (auto vectorType = as<IRVectorType>(type))
+                return checkTypeNeedsStorageCapability(
+                    vectorType->getElementType(),
+                    targets,
+                    found,
+                    visited);
+            break;
+
+        case kIROp_MatrixType:
+            if (auto matrixType = as<IRMatrixType>(type))
+                return checkTypeNeedsStorageCapability(
+                    matrixType->getElementType(),
+                    targets,
+                    found,
+                    visited);
+            break;
+
+        case kIROp_ArrayType:
+        case kIROp_UnsizedArrayType:
+            if (auto arrayType = as<IRArrayTypeBase>(type))
+                return checkTypeNeedsStorageCapability(
+                    arrayType->getElementType(),
+                    targets,
+                    found,
+                    visited);
+            break;
+
+        case kIROp_StructType:
+            if (auto structType = as<IRStructType>(type))
+            {
+                for (auto field : structType->getFields())
+                    if (checkTypeNeedsStorageCapability(
+                            field->getFieldType(),
+                            targets,
+                            found,
+                            visited))
+                        return true;
+            }
+            break;
+
+        case kIROp_AtomicType:
+            if (auto atomicType = as<IRAtomicType>(type))
+                return checkTypeNeedsStorageCapability(
+                    atomicType->getElementType(),
+                    targets,
+                    found,
+                    visited);
+            break;
+
+        case kIROp_PtrType:
+        case kIROp_RefParamType:
+        case kIROp_BorrowInParamType:
+        case kIROp_OutParamType:
+        case kIROp_BorrowInOutParamType:
+            if (auto ptrType = as<IRPtrTypeBase>(type))
+                return checkTypeNeedsStorageCapability(
+                    ptrType->getValueType(),
+                    targets,
+                    found,
+                    visited);
+            break;
+
+        case kIROp_RateQualifiedType:
+            if (auto ptrType = as<IRRateQualifiedType>(type))
+                return checkTypeNeedsStorageCapability(
+                    ptrType->getValueType(),
+                    targets,
+                    found,
+                    visited);
+            break;
+        }
+
+        return false;
+    }
+
+    // Check and require 8/16-bit storage capabilities based on storage class and type
+    void requireCapabilitiesForType(IRType* type, SpvStorageClass storageClass)
+    {
+        // Search for specific aspects of the type, depending on the class.
+        TypeNeedsStorageFlags targets = TypeNeedsStorageFlag::kNone;
+        switch (storageClass)
+        {
+        case SpvStorageClassUniform:
+        case SpvStorageClassStorageBuffer:
+            if (!m_capabilities.contains(SpvCapabilityUniformAndStorageBuffer8BitAccess))
+                targets |= TypeNeedsStorageFlag::kElementSize8;
+            if (!m_capabilities.contains(SpvCapabilityUniformAndStorageBuffer16BitAccess))
+                targets |= TypeNeedsStorageFlag::kElementSize16;
+            break;
+        case SpvStorageClassPushConstant:
+            if (!m_capabilities.contains(SpvCapabilityStoragePushConstant8))
+                targets |= TypeNeedsStorageFlag::kElementSize8;
+            if (!m_capabilities.contains(SpvCapabilityStoragePushConstant16))
+                targets |= TypeNeedsStorageFlag::kElementSize16;
+            break;
+        case SpvStorageClassInput:
+        case SpvStorageClassOutput:
+            if (!m_capabilities.contains(SpvCapabilityStorageInputOutput16))
+                targets |= TypeNeedsStorageFlag::kElementSize16;
+            break;
+        }
+
+        // If we've already enabled all possible capabilities for this storage class, there's no
+        // reason to search again.
+        if (targets == TypeNeedsStorageFlag::kNone)
+            return;
+
+        HashSet<IRType*> visited;
+        TypeNeedsStorageFlags found = TypeNeedsStorageFlag::kNone;
+        checkTypeNeedsStorageCapability(type, targets, found, visited);
+
+        if (found == TypeNeedsStorageFlag::kNone)
+            return;
+
+        switch (storageClass)
+        {
+        case SpvStorageClassUniform:
+        case SpvStorageClassStorageBuffer:
+            if (found & TypeNeedsStorageFlag::kElementSize8)
+            {
+                ensureExtensionDeclarationBeforeSpv15(UnownedStringSlice("SPV_KHR_8bit_storage"));
+                requireSPIRVCapability(SpvCapabilityUniformAndStorageBuffer8BitAccess);
+            }
+            if (found & TypeNeedsStorageFlag::kElementSize16)
+                requireSPIRVCapability(SpvCapabilityUniformAndStorageBuffer16BitAccess);
+            break;
+
+        case SpvStorageClassPushConstant:
+            if (found & TypeNeedsStorageFlag::kElementSize8)
+            {
+                ensureExtensionDeclarationBeforeSpv15(UnownedStringSlice("SPV_KHR_8bit_storage"));
+                requireSPIRVCapability(SpvCapabilityStoragePushConstant8);
+            }
+            if (found & TypeNeedsStorageFlag::kElementSize16)
+                requireSPIRVCapability(SpvCapabilityStoragePushConstant16);
+            break;
+
+        case SpvStorageClassInput:
+        case SpvStorageClassOutput:
+            if (found & TypeNeedsStorageFlag::kElementSize16)
+                requireSPIRVCapability(SpvCapabilityStorageInputOutput16);
+            break;
         }
     }
 
@@ -7965,7 +8486,8 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         SpvInst* firstBlock,
         SpvInst* spvFunc,
         IRDebugFunction* debugFunc,
-        IRFuncType* debugType)
+        IRFuncType* debugType,
+        IRFunc* irFunc = nullptr)
     {
         SpvInst* debugFuncInfo = nullptr;
         if (debugFunc && m_mapIRInstToSpvInst.tryGetValue(debugFunc, debugFuncInfo))
@@ -8002,6 +8524,11 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
             debugFunc->getName(),
             builder.getIntValue(builder.getUIntType(), 0),
             debugFunc->getLine());
+
+        if (irFunc)
+        {
+            registerDebugInst(irFunc, debugFuncInfo);
+        }
 
         if (firstBlock && spvFunc)
         {
@@ -8118,6 +8645,8 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
 
     SpvInst* emitDebugValue(SpvInstParent* parent, IRDebugValue* debugValue)
     {
+        auto debugVar = debugValue->getDebugVar();
+        auto debugValueVal = debugValue->getValue();
         // We are asked to update the value for a debug variable.
         // A debug variable is already emited as a OpDebugVariable +
         // OpVariable + OpDebugDeclare. We only need to store the new value
@@ -8133,7 +8662,7 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         // variable. If it doesn't, we can't emit a store.
         //
         List<IRInst*> irAccessChain;
-        auto rootVar = getRootAddr(debugValue->getDebugVar(), irAccessChain);
+        auto rootVar = getRootAddr(debugVar, irAccessChain);
         SpvInst* spvDebugVar = nullptr;
         if (!m_mapIRInstToSpvInst.tryGetValue(rootVar, spvDebugVar))
             return nullptr;
@@ -8149,7 +8678,7 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
             // be fully static. We will skip emitting the debug inst if the access chain
             // isn't static.
             //
-            auto type = unwrapAttributedType(debugValue->getDebugVar()->getDataType());
+            auto type = unwrapAttributedType(debugVar->getDataType());
             List<SpvInst*> accessChain;
             bool isConstAccessChain =
                 translateIRAccessChain(builder, type, irAccessChain, accessChain);
@@ -8162,7 +8691,7 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                     m_voidType,
                     getNonSemanticDebugInfoExtInst(),
                     rootVar,
-                    debugValue->getValue(),
+                    debugValueVal,
                     getDwarfExpr(),
                     accessChain);
             }
@@ -8174,7 +8703,7 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
         // The ordinary case is the debug variable has a backing ordinary variable.
         // We can simply emit a store into the backing variable for the DebugValue operation.
         //
-        return emitStoreMaybeCoherent(parent, debugValue);
+        return emitStore(parent, debugValue, debugVar, debugValueVal);
     }
 
     IRInst* getName(IRInst* inst)
@@ -8207,7 +8736,7 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
             return ensureInst(m_voidType);
 
         IRBuilder builder(type);
-        if (const auto funcType = as<IRFuncType>(type))
+        if (as<IRFuncType>(type))
         {
             List<SpvInst*> argTypes;
             return emitOpDebugTypeFunction(
@@ -8464,7 +8993,29 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
                 debugBaseType,
                 builder.getIntValue(builder.getUIntType(), kDebugTypeAtomicQualifier));
         }
-        return ensureInst(m_voidType);
+
+        // Fallback for texture types, raytracing types, and other composite types
+        // Declare variables for debug location like struct handling does
+        IRInst* source = m_defaultDebugSource;
+        IRInst* line = builder.getIntValue(builder.getUIntType(), 0);
+        IRInst* col = line;
+
+        // Emit a composite debug type (struct-like for most types)
+        return emitOpDebugTypeComposite(
+            getSection(SpvLogicalSectionID::ConstantsAndTypes),
+            nullptr,
+            m_voidType,
+            getNonSemanticDebugInfoExtInst(),
+            name,
+            builder.getIntValue(builder.getUIntType(), 0),
+            source,
+            line,
+            col,
+            scope,
+            name,
+            builder.getIntValue(builder.getUIntType(), 0), // Size (unknown)
+            builder.getIntValue(builder.getUIntType(), kUnknownPhysicalLayout),
+            List<SpvInst*>()); // No members
     }
 
     SpvInst* emitDebugType(IRType* type)
@@ -9067,10 +9618,16 @@ struct SPIRVEmitContext : public SourceEmitterBase, public SPIRVEmitSharedContex
     {
         if (auto ptrType = as<IRPtrTypeBase>(type))
         {
-            if (ptrType->getAddressSpace() == AddressSpace::StorageBuffer)
+            switch (ptrType->getAddressSpace())
             {
+            case AddressSpace::StorageBuffer:
+                ensureExtensionDeclaration(UnownedStringSlice("SPV_KHR_variable_pointers"));
+                requireSPIRVCapability(SpvCapabilityVariablePointersStorageBuffer);
+                break;
+            case AddressSpace::GroupShared:
                 ensureExtensionDeclaration(UnownedStringSlice("SPV_KHR_variable_pointers"));
                 requireSPIRVCapability(SpvCapabilityVariablePointers);
+                break;
             }
         }
     }
@@ -9181,6 +9738,10 @@ SlangResult emitSPIRVFromIR(
     for (auto inst : irModule->getGlobalInsts())
     {
         if (as<IRDebugSource>(inst))
+        {
+            context.ensureInst(inst);
+        }
+        if (as<IRDebugBuildIdentifier>(inst))
         {
             context.ensureInst(inst);
         }

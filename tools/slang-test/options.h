@@ -44,6 +44,13 @@ enum class SpawnType
     UseFullyIsolatedTestServer, ///< Uses a test server for each test (slow!)
 };
 
+enum class VerbosityLevel
+{
+    Failure, ///< Only show failures and errors
+    Info,    ///< Show test discovery and results (default)
+    Verbose, ///< Show detailed output including command lines
+};
+
 struct Options
 {
     char const* appName = "slang-test";
@@ -57,8 +64,11 @@ struct Options
     // only run test cases with names have one of these prefixes.
     Slang::List<Slang::String> testPrefixes;
 
-    // generate extra output (notably: command lines we run)
-    bool shouldBeVerbose = false;
+    // skip test cases with names that have one of these prefixes.
+    Slang::List<Slang::String> excludePrefixes;
+
+    // verbosity level for output
+    VerbosityLevel verbosity = VerbosityLevel::Info;
 
     // When true results from ignored tests are not shown
     bool hideIgnored = false;
@@ -126,19 +136,32 @@ struct Options
 
     bool emitSPIRVDirectly = true;
 
+    // Whether to enable RHI device caching in render-test (default: true in slang-test)
+    bool cacheRhiDevice = true;
+
     Slang::HashSet<Slang::String> capabilities;
     Slang::HashSet<Slang::String> expectedFailureList;
+
+    // Ignore abort message dialog popup on Windows
+    bool ignoreAbortMsg = false;
 
     /// Parse the args, report any errors into stdError, and write the results into optionsOut
     static SlangResult parse(
         int argc,
         char** argv,
         TestCategorySet* categorySet,
+        Slang::WriterHelper stdOut,
         Slang::WriterHelper stdError,
         Options* optionsOut);
 
     /// Display help message
     static void showHelp(Slang::WriterHelper stdOut);
+
+    /// Whether to shuffle tests
+    bool shuffleTests = false;
+
+    /// Seed for shuffling deterministically
+    uint32_t shuffleSeed = 1;
 };
 
 #endif // OPTIONS_H_INCLUDED

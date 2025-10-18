@@ -70,7 +70,7 @@ bool AutoDiffTranscriberBase::shouldUseOriginalAsPrimal(IRInst* currentParent, I
 {
     if (as<IRGlobalValueWithCode>(origInst))
         return true;
-    if (origInst->parent && origInst->parent->getOp() == kIROp_Module)
+    if (origInst->parent && origInst->parent->getOp() == kIROp_ModuleInst)
         return true;
     if (isChildInstOf(currentParent, origInst->getParent()))
         return true;
@@ -347,17 +347,17 @@ IRType* AutoDiffTranscriberBase::_differentiateTypeImpl(IRBuilder* builder, IRTy
     case kIROp_FuncType:
         return differentiateFunctionType(builder, nullptr, as<IRFuncType>(primalType));
 
-    case kIROp_OutType:
+    case kIROp_OutParamType:
         if (auto diffValueType =
-                differentiateType(builder, as<IROutType>(primalType)->getValueType()))
-            return builder->getOutType(diffValueType);
+                differentiateType(builder, as<IROutParamType>(primalType)->getValueType()))
+            return builder->getOutParamType(diffValueType);
         else
             return nullptr;
 
-    case kIROp_InOutType:
+    case kIROp_BorrowInOutParamType:
         if (auto diffValueType =
-                differentiateType(builder, as<IRInOutType>(primalType)->getValueType()))
-            return builder->getInOutType(diffValueType);
+                differentiateType(builder, as<IRBorrowInOutParamType>(primalType)->getValueType()))
+            return builder->getBorrowInOutParamType(diffValueType);
         else
             return nullptr;
 
@@ -390,6 +390,13 @@ IRType* AutoDiffTranscriberBase::_differentiateTypeImpl(IRBuilder* builder, IRTy
                     diffTypeList.getBuffer());
         }
 
+    case kIROp_OptionalType:
+        {
+            auto origOptionalType = as<IROptionalType>(primalType);
+            auto diffValueType = differentiateType(builder, origOptionalType->getValueType());
+            return builder->getOptionalType(diffValueType);
+        }
+
     default:
         return (IRType*)maybeCloneForPrimalInst(
             builder,
@@ -406,7 +413,7 @@ bool AutoDiffTranscriberBase::isExistentialType(IRType* type)
     case kIROp_ExtractExistentialType:
     case kIROp_InterfaceType:
     case kIROp_AssociatedType:
-    case kIROp_LookupWitness:
+    case kIROp_LookupWitnessMethod:
         return true;
     default:
         return false;

@@ -112,6 +112,7 @@ CLikeSourceEmitter::CLikeSourceEmitter(const Desc& desc)
 
     auto targetCaps = getTargetReq()->getTargetCaps();
     isCoopvecPoc = targetCaps.implies(CapabilityAtom::hlsl_coopvec_poc);
+    isOptixCoopVec = targetCaps.implies(CapabilityAtom::optix_coopvec);
 }
 
 SlangResult CLikeSourceEmitter::init()
@@ -612,7 +613,7 @@ void CLikeSourceEmitter::defaultEmitInstStmt(IRInst* inst)
             m_writer->emit(");\n");
         }
         break;
-    case kIROp_discard:
+    case kIROp_Discard:
         m_writer->emit("discard;\n");
         break;
     default:
@@ -1470,7 +1471,7 @@ bool CLikeSourceEmitter::shouldFoldInstIntoUseSites(IRInst* inst)
     case kIROp_FieldAddress:
     case kIROp_GetElementPtr:
     case kIROp_Specialize:
-    case kIROp_LookupWitness:
+    case kIROp_LookupWitnessMethod:
     case kIROp_GetValueFromBoundInterface:
         return true;
 
@@ -1501,7 +1502,7 @@ bool CLikeSourceEmitter::shouldFoldInstIntoUseSites(IRInst* inst)
     //
     case kIROp_MakeStruct:
     case kIROp_MakeArray:
-    case kIROp_swizzleSet:
+    case kIROp_SwizzleSet:
     case kIROp_MakeArrayFromElement:
     case kIROp_MakeCoopVector:
 
@@ -1618,7 +1619,7 @@ bool CLikeSourceEmitter::shouldFoldInstIntoUseSites(IRInst* inst)
         auto ptrType = load->getPtr()->getDataType();
         if (load->getPtr()->getOp() == kIROp_GlobalParam)
         {
-            if (ptrType->getOp() == kIROp_ConstRefType)
+            if (ptrType->getOp() == kIROp_BorrowInParamType)
                 return true;
             if (auto ptrTypeBase = as<IRPtrTypeBase>(ptrType))
             {
@@ -1678,7 +1679,7 @@ bool CLikeSourceEmitter::shouldFoldInstIntoUseSites(IRInst* inst)
     // for GLSL), so we check this only after all those special cases are
     // considered.
     //
-    if (inst->getOp() == kIROp_undefined)
+    if (as<IRUndefined>(inst))
         return false;
 
     // Okay, at this point we know our instruction must have a single use.
@@ -2243,7 +2244,7 @@ void CLikeSourceEmitter::emitCallExpr(IRCall* inst, EmitOpInfo outerPrec)
     handleRequiredCapabilities(funcValue);
 
     // Detect if this is a call into a COM interface method.
-    if (funcValue->getOp() == kIROp_LookupWitness)
+    if (funcValue->getOp() == kIROp_LookupWitnessMethod)
     {
         auto operand0Type = funcValue->getOperand(0)->getDataType();
         switch (operand0Type->getOp())
@@ -2387,7 +2388,8 @@ void CLikeSourceEmitter::defaultEmitInstExpr(IRInst* inst, const EmitOpInfo& inO
     case kIROp_RTTIPointerType:
         break;
 
-    case kIROp_undefined:
+    case kIROp_LoadFromUninitializedMemory:
+    case kIROp_Poison:
     case kIROp_DefaultConstruct:
         m_writer->emit(getName(inst));
         break;
@@ -2542,6 +2544,9 @@ void CLikeSourceEmitter::defaultEmitInstExpr(IRInst* inst, const EmitOpInfo& inO
     case kIROp_CastDescriptorHandleToUInt2:
     case kIROp_CastUInt2ToDescriptorHandle:
     case kIROp_CastDescriptorHandleToResource:
+    case kIROp_CastResourceToDescriptorHandle:
+    case kIROp_CastUInt64ToDescriptorHandle:
+    case kIROp_CastDescriptorHandleToUInt64:
         emitOperand(inst->getOperand(0), outerPrec);
         break;
     // Binary ops
@@ -2706,10 +2711,10 @@ void CLikeSourceEmitter::defaultEmitInstExpr(IRInst* inst, const EmitOpInfo& inO
     case kIROp_NonUniformResourceIndex:
         emitOperand(
             inst->getOperand(0),
-            getInfo(EmitOp::General)); // Directly emit NonUniformResourceIndex Operand0;
+            outerPrec); // Directly emit NonUniformResourceIndex Operand0;
         break;
 
-    case kIROp_getNativeStr:
+    case kIROp_GetNativeStr:
         {
             auto prec = getInfo(EmitOp::Postfix);
             needClose = maybeEmitParens(outerPrec, prec);
@@ -2827,7 +2832,7 @@ void CLikeSourceEmitter::defaultEmitInstExpr(IRInst* inst, const EmitOpInfo& inO
         }
         break;
 
-    case kIROp_swizzle:
+    case kIROp_Swizzle:
         {
             auto prec = getInfo(EmitOp::Postfix);
             needClose = maybeEmitParens(outerPrec, prec);
@@ -3210,6 +3215,7 @@ void CLikeSourceEmitter::_emitInst(IRInst* inst)
     case kIROp_DebugNoScope:
     case kIROp_DebugInlinedVariable:
     case kIROp_DebugFunction:
+    case kIROp_DebugBuildIdentifier:
         break;
 
     case kIROp_Unmodified:
@@ -3240,7 +3246,8 @@ void CLikeSourceEmitter::_emitInst(IRInst* inst)
     case kIROp_LiveRangeEnd:
         emitLiveness(inst);
         break;
-    case kIROp_undefined:
+    case kIROp_LoadFromUninitializedMemory:
+    case kIROp_Poison:
     case kIROp_DefaultConstruct:
         {
             auto type = inst->getDataType();
@@ -3283,11 +3290,11 @@ void CLikeSourceEmitter::_emitInst(IRInst* inst)
         m_writer->emit(";\n");
         break;
 
-    case kIROp_discard:
+    case kIROp_Discard:
         emitInstStmt(inst);
         break;
 
-    case kIROp_swizzleSet:
+    case kIROp_SwizzleSet:
         {
             auto ii = (IRSwizzleSet*)inst;
             emitInstResultDecl(inst);
@@ -3604,7 +3611,7 @@ void CLikeSourceEmitter::emitRegion(Region* inRegion)
                     break;
 
                 case kIROp_Return:
-                case kIROp_discard:
+                case kIROp_Discard:
                     // For extremely simple terminators, we just handle
                     // them here, so that we don't have to allocate
                     // separate `Region`s for them.
@@ -3875,24 +3882,24 @@ void CLikeSourceEmitter::emitParamTypeImpl(IRType* type, String const& name)
     // encoded as a parameter of pointer type, so
     // we need to decode that here.
     //
-    if (auto outType = as<IROutType>(type))
+    if (auto outType = as<IROutParamType>(type))
     {
         m_writer->emit("out ");
         type = outType->getValueType();
     }
-    else if (auto inOutType = as<IRInOutType>(type))
+    else if (auto inOutType = as<IRBorrowInOutParamType>(type))
     {
         m_writer->emit("inout ");
         type = inOutType->getValueType();
     }
-    else if (auto refType = as<IRRefType>(type))
+    else if (auto refType = as<IRRefParamType>(type))
     {
         // Note: There is no HLSL/GLSL equivalent for by-reference parameters,
         // so we don't actually expect to encounter these in user code.
         m_writer->emit("inout ");
         type = refType->getValueType();
     }
-    else if (auto constRefType = as<IRConstRefType>(type))
+    else if (auto constRefType = as<IRBorrowInParamType>(type))
     {
         type = constRefType->getValueType();
     }
@@ -4802,7 +4809,7 @@ void CLikeSourceEmitter::_emitInstAsVarInitializerImpl(IRInst* inst)
 
 bool _isFoldableValue(IRInst* val)
 {
-    if (val->getParent() && val->getParent()->getOp() == kIROp_Module)
+    if (val->getParent() && val->getParent()->getOp() == kIROp_ModuleInst)
         return true;
 
     switch (val->getOp())
@@ -4944,7 +4951,7 @@ void CLikeSourceEmitter::emitGlobalParam(IRGlobalParam* varDecl)
             varType = ptrType->getValueType();
             break;
         default:
-            if (as<IROutTypeBase>(ptrType))
+            if (as<IROutParamTypeBase>(ptrType))
                 varType = ptrType->getValueType();
             break;
         }
@@ -5146,7 +5153,7 @@ void CLikeSourceEmitter::ensureInstOperandsRec(ComputeEmitActionsContext* ctx, I
     case kIROp_NativePtrType:
         requiredLevel = EmitAction::ForwardDeclaration;
         break;
-    case kIROp_LookupWitness:
+    case kIROp_LookupWitnessMethod:
     case kIROp_FieldExtract:
     case kIROp_FieldAddress:
         {
@@ -5214,6 +5221,7 @@ void CLikeSourceEmitter::ensureGlobalInst(
     case kIROp_DebugSource:
     case kIROp_DebugValue:
     case kIROp_DebugInlinedVariable:
+    case kIROp_DebugBuildIdentifier:
         return;
     default:
         break;
@@ -5331,7 +5339,8 @@ void CLikeSourceEmitter::computeEmitActions(IRModule* module, List<EmitAction>& 
         // Skip resource types in this pass.
         if (isResourceType(inst->getDataType()))
             continue;
-
+        if (as<IRInterfaceRequirementEntry>(inst))
+            continue;
         ensureGlobalInst(&ctx, inst, EmitAction::Level::Definition);
     }
 }

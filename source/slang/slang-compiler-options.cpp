@@ -143,6 +143,7 @@ void CompilerOptionSet::writeCommandLineArgs(Session* globalSession, StringBuild
         case CompilerOptionName::EmitSpirvDirectly:
         case CompilerOptionName::GLSLForceScalarLayout:
         case CompilerOptionName::ForceDXLayout:
+        case CompilerOptionName::ForceCLayout:
         case CompilerOptionName::MatrixLayoutRow:
         case CompilerOptionName::MatrixLayoutColumn:
         case CompilerOptionName::VulkanInvertY:
@@ -198,6 +199,7 @@ bool CompilerOptionSet::allowDuplicate(CompilerOptionName name)
     case CompilerOptionName::DownstreamArgs:
     case CompilerOptionName::VulkanBindShift:
     case CompilerOptionName::VulkanBindShiftAll:
+    case CompilerOptionName::TypeConformance:
         return true;
     }
     return false;

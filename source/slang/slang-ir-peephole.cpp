@@ -256,7 +256,7 @@ struct PeepholeContext : InstPassBase
     {
         if (as<IRGlobalValueWithCode>(inst))
         {
-            if (auto fpModeDecor = inst->findDecoration<IRFloatingModeOverrideDecoration>())
+            if (auto fpModeDecor = inst->findDecoration<IRFloatingPointModeOverrideDecoration>())
                 floatingPointMode = fpModeDecor->getFloatingPointMode();
         }
 
@@ -281,7 +281,7 @@ struct PeepholeContext : InstPassBase
                         baseType,
                         &sizeAlignment)))
                     break;
-                if (sizeAlignment.size == 0)
+                if (sizeAlignment.size == IRSizeAndAlignment::kIndeterminateSize)
                     break;
 
                 IRBuilder builder(module);
@@ -802,13 +802,33 @@ struct PeepholeContext : InstPassBase
             {
                 if (inst->getOperand(0)->getOp() == kIROp_MakeOptionalValue)
                 {
-                    IRBuilder builder(module);
-                    IRBuilderSourceLocRAII srcLocRAII(&builder, inst->sourceLoc);
-                    builder.setInsertBefore(inst);
-                    auto trueVal = builder.getBoolValue(true);
-                    inst->replaceUsesWith(trueVal);
-                    maybeRemoveOldInst(inst);
-                    changed = true;
+                    auto getHasValue = as<IROptionalHasValue>(inst);
+                    auto optionalType =
+                        as<IROptionalType>(getHasValue->getOptionalOperand()->getDataType());
+                    if (!optionalType)
+                        break;
+                    if (as<IROptionalType>(optionalType->getValueType()))
+                    {
+                        // HasValue(o : Optional<Optional<T>>) ==> HasValue(o.value).
+                        IRBuilder builder(module);
+                        IRBuilderSourceLocRAII srcLocRAII(&builder, inst->sourceLoc);
+                        builder.setInsertBefore(inst);
+                        auto newVal = builder.emitOptionalHasValue(
+                            builder.emitGetOptionalValue(getHasValue->getOptionalOperand()));
+                        inst->replaceUsesWith(newVal);
+                        maybeRemoveOldInst(inst);
+                        changed = true;
+                    }
+                    else
+                    {
+                        IRBuilder builder(module);
+                        IRBuilderSourceLocRAII srcLocRAII(&builder, inst->sourceLoc);
+                        builder.setInsertBefore(inst);
+                        auto trueVal = builder.getBoolValue(true);
+                        inst->replaceUsesWith(trueVal);
+                        maybeRemoveOldInst(inst);
+                        changed = true;
+                    }
                 }
                 else if (inst->getOperand(0)->getOp() == kIROp_MakeOptionalNone)
                 {
@@ -843,7 +863,7 @@ struct PeepholeContext : InstPassBase
                 }
             }
             break;
-        case kIROp_LookupWitness:
+        case kIROp_LookupWitnessMethod:
             {
                 if (inst->getOperand(0)->getOp() == kIROp_WitnessTable)
                 {
@@ -1021,7 +1041,7 @@ struct PeepholeContext : InstPassBase
                         continue;
                     SLANG_ASSERT(terminator->getArgCount() > paramIndex);
                     auto arg = terminator->getArg(paramIndex);
-                    if (arg->getOp() == kIROp_undefined)
+                    if (as<IRUndefined>(arg))
                         continue;
                     if (argValue == nullptr)
                         argValue = arg;
@@ -1070,7 +1090,7 @@ struct PeepholeContext : InstPassBase
                 }
             }
             break;
-        case kIROp_swizzle:
+        case kIROp_Swizzle:
             {
                 // If we see a swizzle(scalar), we replace it with makeVectorFromScalar.
                 if (as<IRBasicType>(inst->getOperand(0)->getDataType()))
@@ -1248,14 +1268,18 @@ struct PeepholeContext : InstPassBase
             }
         case kIROp_Load:
             {
-                // Load from undef is undef.
-                if (as<IRLoad>(inst)->getPtr()->getOp() == kIROp_undefined)
+                // An attempt to load from an undefined pointer value
+                // is undefined behavior and the resulting value is poison
+                // (the value should typically contaminate instructions that
+                // use it, rendering them as poisonous).
+                //
+                if (as<IRUndefined>(as<IRLoad>(inst)->getPtr()))
                 {
                     IRBuilder builder(module);
                     IRBuilderSourceLocRAII srcLocRAII(&builder, inst->sourceLoc);
 
                     builder.setInsertBefore(inst);
-                    auto undef = builder.emitUndefined(inst->getDataType());
+                    auto undef = builder.emitPoison(inst->getDataType());
                     inst->replaceUsesWith(undef);
                     maybeRemoveOldInst(inst);
                     changed = true;
@@ -1264,8 +1288,17 @@ struct PeepholeContext : InstPassBase
             }
         case kIROp_Store:
             {
-                // Store undef is no-op.
-                if (as<IRStore>(inst)->getVal()->getOp() == kIROp_undefined)
+                // An attempt to store to an undefined pointer value is
+                // undefined behavior (just like a load), so we can conveniently
+                // decide to implement that behavior as a no-op.
+                //
+                // TODO: While it is not the responsibility of a pass like this
+                // to diagnose errors (that is the front-end's job), it might
+                // be best to replace an invalid `store` like this with an
+                // instruction that represents a "panic" or similar exceptional
+                // situation.
+                //
+                if (as<IRUndefined>(as<IRStore>(inst)->getVal()))
                 {
                     maybeRemoveOldInst(inst);
                     changed = true;
@@ -1274,8 +1307,16 @@ struct PeepholeContext : InstPassBase
             }
         case kIROp_DebugValue:
             {
-                // Update debug value with undef is no-op.
-                if (as<IRDebugValue>(inst)->getValue()->getOp() == kIROp_undefined)
+                // Attempting to update the debug value of a variable with an
+                // undefined value will be treated as a no-op (meaning that the
+                // contents of the variable, as perceived by the user, will not
+                // change).
+                //
+                // TODO: We should probably validate that this is a reasonable
+                // behavior. In many cases a debugger user might like to have an
+                // indication of when the contents of their variable are undefined.
+                //
+                if (as<IRUndefined>(as<IRDebugValue>(inst)->getValue()))
                 {
                     maybeRemoveOldInst(inst);
                     changed = true;
@@ -1289,7 +1330,7 @@ struct PeepholeContext : InstPassBase
 
     bool isConcreteType(IRType* type)
     {
-        return type->parent->getOp() == kIROp_Module && !as<IRGlobalGenericParam>(type);
+        return type->parent->getOp() == kIROp_ModuleInst && !as<IRGlobalGenericParam>(type);
     }
 
     bool processFunc(IRInst* func)
