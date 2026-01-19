@@ -463,6 +463,15 @@ DeclRefExpr* SemanticsVisitor::ConstructDeclRefExpr(
             // only to avoid modifying the child
             expr->type.isWriteOnly = baseExpr->type.isWriteOnly || expr->type.isWriteOnly;
 
+            // It's not valid to reference a non-static member with a static
+            // func using 'this'.
+            if (getSink() && m_parentFunc && m_parentFunc->hasModifier<HLSLStaticModifier>() &&
+                !isDeclUsableAsStaticMember(declRef.getDecl()) && as<ThisExpr>(baseExpr))
+            {
+                getSink()->diagnose(loc, Diagnostics::staticRefToThis, declRef.getName());
+                expr->type = m_astBuilder->getErrorType();
+            }
+
             // When referring to a member through an expression,
             // the result is only an l-value if both the base
             // expression and the member agree that it should be.
@@ -2970,7 +2979,7 @@ Expr* SemanticsVisitor::CheckInvokeExprWithCheckedOperands(InvokeExpr* expr)
             Index paramCount = funcType->getParamCount();
             for (Index pp = 0; pp < paramCount; ++pp)
             {
-                auto paramType = funcType->getParamTypeWithDirectionWrapper(pp);
+                auto paramType = funcType->getParamTypeWithModeWrapper(pp);
                 Expr* argExpr = nullptr;
                 ParamDecl* paramDecl = nullptr;
                 if (pp < invoke->arguments.getCount())
@@ -3727,11 +3736,10 @@ Type* SemanticsVisitor::getForwardDiffFuncType(FuncType* originalType)
     for (Index i = 0; i < originalType->getParamCount(); i++)
     {
         if (auto jvpParamType =
-                _toDifferentialParamType(originalType->getParamTypeWithDirectionWrapper(i)))
+                _toDifferentialParamType(originalType->getParamTypeWithModeWrapper(i)))
             paramTypes.add(jvpParamType);
     }
-    FuncType* jvpType =
-        m_astBuilder->getOrCreate<FuncType>(paramTypes.getArrayView(), resultType, errorType);
+    FuncType* jvpType = m_astBuilder->getFuncType(paramTypes.getArrayView(), resultType, errorType);
 
     return jvpType;
 }
@@ -3753,7 +3761,7 @@ Type* SemanticsVisitor::getBackwardDiffFuncType(FuncType* originalType)
 
     for (Index i = 0; i < originalType->getParamCount(); i++)
     {
-        auto originalParamType = originalType->getParamTypeWithDirectionWrapper(i);
+        auto originalParamType = originalType->getParamTypeWithModeWrapper(i);
 
         if (auto outType = as<OutType>(originalParamType))
         {
@@ -3792,7 +3800,7 @@ Type* SemanticsVisitor::getBackwardDiffFuncType(FuncType* originalType)
     if (dOutType)
         paramTypes.add(dOutType);
 
-    return m_astBuilder->getOrCreate<FuncType>(paramTypes.getArrayView(), resultType, errorType);
+    return m_astBuilder->getFuncType(paramTypes.getArrayView(), resultType, errorType);
 }
 
 struct HigherOrderInvokeExprCheckingActions
@@ -4212,6 +4220,16 @@ Expr* SemanticsExprVisitor::visitSizeOfLikeExpr(SizeOfLikeExpr* sizeOfLikeExpr)
             sizeOfLikeExpr->type = m_astBuilder->getErrorType();
             return sizeOfLikeExpr;
         }
+
+        // DescriptorHandle size is target-dependent, so sizeof/alignof cannot be
+        // evaluated at compile-time. Users should use reflection API instead.
+        if (as<DescriptorHandleType>(type))
+        {
+            getSink()->diagnose(sizeOfLikeExpr, Diagnostics::sizeOfDescriptorHandleNotAllowed);
+
+            sizeOfLikeExpr->type = m_astBuilder->getErrorType();
+            return sizeOfLikeExpr;
+        }
     }
 
     sizeOfLikeExpr->sizedType = type;
@@ -4423,7 +4441,7 @@ Expr* SemanticsExprVisitor::visitTypeCastExpr(TypeCastExpr* expr)
                 auto arg = expr->arguments[0];
                 if (auto intLitArg = as<IntegerLiteralExpr>(arg))
                 {
-                    if (getIntegerLiteralValue(intLitArg->token) == 0)
+                    if (getIntegerLiteralValue(intLitArg->token, getSink()) == 0)
                     {
                         // At this point we have confirmed that the cast
                         // has the right form, so we want to apply our special case.
@@ -4837,7 +4855,7 @@ Expr* SemanticsExprVisitor::visitLambdaExpr(LambdaExpr* lambdaExpr)
         genApp->arguments.add(returnTypeExp);
         for (auto param : getMembersOfType<ParamDecl>(m_astBuilder, lambdaExpr->paramScopeDecl))
         {
-            auto paramType = getParamTypeWithDirectionWrapper(m_astBuilder, param);
+            auto paramType = getParamTypeWithModeWrapper(m_astBuilder, param);
             auto paramTypeExp = synthesizer.emitStaticTypeExpr(paramType);
             genApp->arguments.add(paramTypeExp);
         }
@@ -5576,14 +5594,6 @@ Expr* SemanticsVisitor::maybeInsertImplicitOpForMemberBase(
 
     baseExpr = derefExpr;
 
-    // If the base of the member lookup has an interface type
-    // *without* a suitable this-type substitution, then we are
-    // trying to perform lookup on a value of existential type,
-    // and we should "open" the existential here so that we
-    // can expose its structure.
-    //
-    baseExpr = maybeOpenExistential(baseExpr);
-
     // In case our base expressin is still overloaded, we can perform
     // some more refinement.
     //
@@ -5620,6 +5630,15 @@ Expr* SemanticsVisitor::maybeInsertImplicitOpForMemberBase(
             overloadedExpr);
         // TODO: handle other cases of OverloadedExpr that need filtering.
     }
+
+    // If the base of the member lookup has an interface type
+    // *without* a suitable this-type substitution, then we are
+    // trying to perform lookup on a value of existential type,
+    // and we should "open" the existential here so that we
+    // can expose its structure.
+    //
+    baseExpr = maybeOpenExistential(baseExpr);
+
 
     return baseExpr;
 }

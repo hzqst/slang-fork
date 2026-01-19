@@ -215,6 +215,7 @@ public:
     Scope* slangLanguageScope = nullptr;
     Scope* glslLanguageScope = nullptr;
     Name* glslModuleName = nullptr;
+    Name* neuralModuleName = nullptr;
 
     ModuleDecl* baseModuleDecl = nullptr;
     List<RefPtr<Module>> coreModules;
@@ -310,6 +311,8 @@ public:
     void addDownstreamCompileTime(double time) { m_downstreamCompileTime += time; }
     void addTotalCompileTime(double time) { m_totalCompileTime += time; }
 
+    ISlangSharedLibrary* getOrLoadSlangLLVM();
+
     ComPtr<ISlangSharedLibraryLoader>
         m_sharedLibraryLoader; ///< The shared library loader (never null)
 
@@ -321,6 +324,8 @@ public:
         PassThroughMode::CountOf)]; ///< A downstream compiler for a pass through
     DownstreamCompilerLocatorFunc m_downstreamCompilerLocators[int(PassThroughMode::CountOf)];
     Name* m_completionTokenName = nullptr; ///< The name of a completion request token.
+
+    ComPtr<ISlangSharedLibrary> m_slangLLVM = nullptr; ///< slang-llvm, loaded on-demand.
 
     /// For parsing command line options
     CommandOptions m_commandOptions;

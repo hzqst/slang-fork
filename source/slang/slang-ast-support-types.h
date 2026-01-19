@@ -63,6 +63,7 @@ FIDDLE() namespace Slang
     void printDiagnosticArg(StringBuilder & sb, ASTNodeType nodeType);
     void printDiagnosticArg(StringBuilder & sb, const CapabilitySet& set);
     void printDiagnosticArg(StringBuilder & sb, List<CapabilityAtom> & set);
+    void printDiagnosticArg(StringBuilder & sb, const CapabilitySetVal* set);
 
     struct QualifiedDeclPath
     {
@@ -1641,6 +1642,7 @@ FIDDLE() namespace Slang
     {
         Val* val = nullptr;
         Expr* expr = nullptr;
+        String toString();
     };
     typedef List<SpecializationArg> SpecializationArgs;
 

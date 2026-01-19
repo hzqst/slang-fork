@@ -225,6 +225,7 @@ static RefPtr<ExtensionTracker> _newExtensionTracker(CodeGenTarget target)
     {
     case CodeGenTarget::PTX:
     case CodeGenTarget::CUDASource:
+    case CodeGenTarget::CUDAHeader:
         {
             return new CUDAExtensionTracker;
         }
@@ -1012,12 +1013,16 @@ SlangResult CodeGenContext::emitWithDownstreamForEntryPoints(ComPtr<IArtifact>& 
     // Compile
     ComPtr<IArtifact> artifact;
     auto downstreamStartTime = std::chrono::high_resolution_clock::now();
-    SLANG_RETURN_ON_FAIL(compiler->compile(options, artifact.writeRef()));
+    SlangResult compileResult = compiler->compile(options, artifact.writeRef());
     auto downstreamElapsedTime =
         (std::chrono::high_resolution_clock::now() - downstreamStartTime).count() * 0.000000001;
     getSession()->addDownstreamCompileTime(downstreamElapsedTime);
 
+    // Extract diagnostics regardless of compile result
     SLANG_RETURN_ON_FAIL(passthroughDownstreamDiagnostics(getSink(), compiler, artifact));
+
+    // Now check if compile failed
+    SLANG_RETURN_ON_FAIL(compileResult);
 
     // Copy over all of the information associated with the source into the output
     if (sourceArtifact)
@@ -1038,6 +1043,8 @@ SlangResult emitSPIRVForEntryPointsDirectly(
     ComPtr<IArtifact>& outArtifact);
 
 SlangResult emitHostVMCode(CodeGenContext* codeGenContext, ComPtr<IArtifact>& outArtifact);
+
+SlangResult emitLLVMForEntryPoints(CodeGenContext* codeGenContext, ComPtr<IArtifact>& outArtifact);
 
 static CodeGenTarget _getIntermediateTarget(CodeGenTarget target)
 {
@@ -1143,13 +1150,26 @@ SlangResult CodeGenContext::_emitEntryPoints(ComPtr<IArtifact>& outArtifact)
     case CodeGenTarget::DXBytecode:
     case CodeGenTarget::MetalLib:
     case CodeGenTarget::PTX:
-    case CodeGenTarget::ShaderHostCallable:
-    case CodeGenTarget::ShaderSharedLibrary:
-    case CodeGenTarget::HostExecutable:
-    case CodeGenTarget::HostHostCallable:
-    case CodeGenTarget::HostSharedLibrary:
     case CodeGenTarget::WGSLSPIRV:
         SLANG_RETURN_ON_FAIL(emitWithDownstreamForEntryPoints(outArtifact));
+        return SLANG_OK;
+    case CodeGenTarget::ShaderSharedLibrary:
+    case CodeGenTarget::HostExecutable:
+    case CodeGenTarget::HostSharedLibrary:
+    case CodeGenTarget::ShaderHostCallable:
+    case CodeGenTarget::HostHostCallable:
+    case CodeGenTarget::HostLLVMIR:
+    case CodeGenTarget::ShaderLLVMIR:
+    case CodeGenTarget::HostObjectCode:
+    case CodeGenTarget::ShaderObjectCode:
+        if (isCPUTargetViaLLVM(getTargetReq()))
+        {
+            SLANG_RETURN_ON_FAIL(emitLLVMForEntryPoints(this, outArtifact));
+        }
+        else
+        {
+            SLANG_RETURN_ON_FAIL(emitWithDownstreamForEntryPoints(outArtifact));
+        }
         return SLANG_OK;
     case CodeGenTarget::HostVM:
         SLANG_RETURN_ON_FAIL(emitHostVMCode(this, outArtifact));
@@ -1206,6 +1226,10 @@ SlangResult CodeGenContext::emitEntryPoints(ComPtr<IArtifact>& outArtifact)
     case CodeGenTarget::HostSharedLibrary:
     case CodeGenTarget::WGSLSPIRVAssembly:
     case CodeGenTarget::HostVM:
+    case CodeGenTarget::HostObjectCode:
+    case CodeGenTarget::ShaderObjectCode:
+    case CodeGenTarget::HostLLVMIR:
+    case CodeGenTarget::ShaderLLVMIR:
         {
             SLANG_RETURN_ON_FAIL(_emitEntryPoints(outArtifact));
 
@@ -1216,7 +1240,9 @@ SlangResult CodeGenContext::emitEntryPoints(ComPtr<IArtifact>& outArtifact)
     case CodeGenTarget::GLSL:
     case CodeGenTarget::HLSL:
     case CodeGenTarget::CUDASource:
+    case CodeGenTarget::CUDAHeader:
     case CodeGenTarget::CPPSource:
+    case CodeGenTarget::CPPHeader:
     case CodeGenTarget::HostCPPSource:
     case CodeGenTarget::PyTorchCppBinding:
     case CodeGenTarget::CSource:
@@ -1356,6 +1382,12 @@ bool CodeGenContext::shouldReportCheckpointIntermediates()
 {
     return getTargetProgram()->getOptionSet().getBoolOption(
         CompilerOptionName::ReportCheckpointIntermediates);
+}
+
+bool CodeGenContext::shouldReportDynamicDispatchSites()
+{
+    return getTargetProgram()->getOptionSet().getBoolOption(
+        CompilerOptionName::ReportDynamicDispatchSites);
 }
 
 bool CodeGenContext::shouldDumpIntermediates()

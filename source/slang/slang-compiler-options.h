@@ -89,7 +89,7 @@ class Session;
 
 struct CompilerOptionSet
 {
-    void load(uint32_t count, slang::CompilerOptionEntry* entries);
+    void load(uint32_t count, const slang::CompilerOptionEntry* entries);
 
     void buildHash(DigestBuilder<SHA1>& builder);
 
@@ -371,6 +371,11 @@ struct CompilerOptionSet
     bool shouldEmitSeparateDebugInfo()
     {
         return getBoolOption(CompilerOptionName::EmitSeparateDebug);
+    }
+
+    bool shouldEmitRichDiagnostics()
+    {
+        return getBoolOption(CompilerOptionName::EnableRichDiagnostics);
     }
 
     FloatingPointMode getFloatingPointMode()
