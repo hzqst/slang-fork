@@ -551,13 +551,14 @@ static void validateVectorOrMatrixElementType(
     SourceLoc sourceLoc,
     IRType* elementType,
     uint32_t allowedWidths,
-    const DiagnosticInfo& disallowedElementTypeEncountered)
+    const DiagnosticInfo& disallowedElementTypeEncountered,
+    TargetRequest* targetRequest)
 {
     if (!isFloatingType(elementType))
     {
         if (isIntegralType(elementType))
         {
-            IntInfo info = getIntTypeInfo(elementType);
+            IntInfo info = getIntTypeInfo(targetRequest, elementType);
             if (allowedWidths == 0U)
             {
                 sink->diagnose(sourceLoc, disallowedElementTypeEncountered, elementType);
@@ -647,7 +648,8 @@ void validateVectorsAndMatrices(
                 vectorType->sourceLoc,
                 elementType,
                 allowedWidths,
-                Diagnostics::vectorWithDisallowedElementTypeEncountered);
+                Diagnostics::vectorWithDisallowedElementTypeEncountered,
+                targetRequest);
 
             validateVectorElementCount(sink, vectorType);
         }
@@ -771,6 +773,11 @@ bool validateStructuredBufferResourceTypes(
 {
     StructuredBufferValidationContext context(sink, targetRequest);
     return context.validate(module);
+}
+
+void validateAtomicOperations(IRModule* module, bool skipFuncParamValidation, DiagnosticSink* sink)
+{
+    validateAtomicOperations(skipFuncParamValidation, sink, module->getModuleInst());
 }
 
 } // namespace Slang

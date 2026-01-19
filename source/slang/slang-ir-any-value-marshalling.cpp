@@ -1,8 +1,8 @@
 #include "slang-ir-any-value-marshalling.h"
 
 #include "../core/slang-math.h"
-#include "slang-ir-generics-lowering-context.h"
 #include "slang-ir-insts.h"
+#include "slang-ir-util.h"
 #include "slang-ir.h"
 #include "slang-legalize-types.h"
 
@@ -14,7 +14,37 @@ namespace Slang
 // functions.
 struct AnyValueMarshallingContext
 {
-    SharedGenericsLoweringContext* sharedContext;
+    IRModule* module;
+    TargetProgram* targetProgram;
+
+    // We will use a single work list of instructions that need
+    // to be considered for lowering.
+    //
+    InstWorkList workList;
+    InstHashSet workListSet;
+
+    AnyValueMarshallingContext(IRModule* module, TargetProgram* targetProgram)
+        : module(module), targetProgram(targetProgram), workList(module), workListSet(module)
+    {
+    }
+
+    void addToWorkList(IRInst* inst)
+    {
+        if (!inst)
+            return;
+
+        for (auto ii = inst->getParent(); ii; ii = ii->getParent())
+        {
+            if (as<IRGeneric>(ii))
+                return;
+        }
+
+        if (workListSet.contains(inst))
+            return;
+
+        workList.add(inst);
+        workListSet.add(inst);
+    }
 
     // Stores information about generated `AnyValue` struct types.
     struct AnyValueTypeInfo : RefObject
@@ -54,7 +84,7 @@ struct AnyValueMarshallingContext
         if (auto typeInfo = generatedAnyValueTypes.tryGetValue(size))
             return typeInfo->Ptr();
         RefPtr<AnyValueTypeInfo> info = new AnyValueTypeInfo();
-        IRBuilder builder(sharedContext->module);
+        IRBuilder builder(module);
         builder.setInsertBefore(type);
         auto structType = builder.createStructType();
         info->type = structType;
@@ -79,6 +109,7 @@ struct AnyValueMarshallingContext
 
     struct TypeMarshallingContext
     {
+        TargetRequest* targetRequest;
         AnyValueTypeInfo* anyValInfo;
         uint32_t fieldOffset;
         uint32_t intraFieldOffset;
@@ -122,6 +153,19 @@ struct AnyValueMarshallingContext
             intraFieldOffset = 0;
             return;
         }
+
+        void ensureOffsetAtNByteBoundary(int n)
+        {
+            if (n == 1)
+                return;
+            else if (n == 2)
+                ensureOffsetAt2ByteBoundary();
+            else if (n == 4)
+                ensureOffsetAt4ByteBoundary();
+            else if (n == 8)
+                ensureOffsetAt8ByteBoundary();
+        }
+
         void advanceOffset(uint32_t bytes)
         {
             intraFieldOffset += bytes;
@@ -273,9 +317,6 @@ struct AnyValueMarshallingContext
             {
             case kIROp_IntType:
             case kIROp_FloatType:
-#if SLANG_PTR_IS_32
-            case kIROp_IntPtrType:
-#endif
                 {
                     ensureOffsetAt4ByteBoundary();
                     if (fieldOffset < static_cast<uint32_t>(anyValInfo->fieldKeys.getCount()))
@@ -316,9 +357,6 @@ struct AnyValueMarshallingContext
                     break;
                 }
             case kIROp_UIntType:
-#if SLANG_PTR_IS_32
-            case kIROp_UIntPtrType:
-#endif
                 {
                     ensureOffsetAt4ByteBoundary();
                     if (fieldOffset < static_cast<uint32_t>(anyValInfo->fieldKeys.getCount()))
@@ -430,34 +468,53 @@ struct AnyValueMarshallingContext
                 }
                 break;
             case kIROp_PtrType:
-#if SLANG_PTR_IS_64
             case kIROp_UIntPtrType:
             case kIROp_IntPtrType:
-#endif
-                ensureOffsetAt8ByteBoundary();
-                if (fieldOffset < static_cast<uint32_t>(anyValInfo->fieldKeys.getCount()))
                 {
-                    auto srcVal = builder->emitLoad(concreteVar);
-                    // Use uint2 instead of uint64 to avoid Int64 capability requirement
-                    auto uint2Type = builder->getVectorType(builder->getUIntType(), 2);
-                    auto uint2Val = builder->emitBitCast(uint2Type, srcVal);
-                    auto lowBits = builder->emitElementExtract(uint2Val, IRIntegerValue(0));
-                    auto highBits = builder->emitElementExtract(uint2Val, IRIntegerValue(1));
-
-                    auto dstAddr = builder->emitFieldAddress(
-                        uintPtrType,
-                        anyValueVar,
-                        anyValInfo->fieldKeys[fieldOffset]);
-                    builder->emitStore(dstAddr, lowBits);
-                    fieldOffset++;
+                    auto ptrSize = getPointerSize(targetRequest);
+                    ensureOffsetAtNByteBoundary(int(ptrSize));
                     if (fieldOffset < static_cast<uint32_t>(anyValInfo->fieldKeys.getCount()))
                     {
-                        dstAddr = builder->emitFieldAddress(
-                            uintPtrType,
-                            anyValueVar,
-                            anyValInfo->fieldKeys[fieldOffset]);
-                        builder->emitStore(dstAddr, highBits);
-                        fieldOffset++;
+                        auto srcVal = builder->emitLoad(concreteVar);
+
+                        if (ptrSize == 8)
+                        {
+                            // Use uint2 instead of uint64 to avoid Int64 capability requirement
+                            auto uint2Type = builder->getVectorType(builder->getUIntType(), 2);
+                            auto uint2Val = builder->emitBitCast(uint2Type, srcVal);
+                            auto lowBits = builder->emitElementExtract(uint2Val, IRIntegerValue(0));
+                            auto highBits =
+                                builder->emitElementExtract(uint2Val, IRIntegerValue(1));
+
+                            auto dstAddr = builder->emitFieldAddress(
+                                uintPtrType,
+                                anyValueVar,
+                                anyValInfo->fieldKeys[fieldOffset]);
+                            builder->emitStore(dstAddr, lowBits);
+                            fieldOffset++;
+                            if (fieldOffset <
+                                static_cast<uint32_t>(anyValInfo->fieldKeys.getCount()))
+                            {
+                                dstAddr = builder->emitFieldAddress(
+                                    uintPtrType,
+                                    anyValueVar,
+                                    anyValInfo->fieldKeys[fieldOffset]);
+                                builder->emitStore(dstAddr, highBits);
+                                fieldOffset++;
+                            }
+                        }
+                        else if (ptrSize == 4)
+                        {
+                            auto dstVal = builder->emitBitCast(builder->getUIntType(), srcVal);
+                            auto dstAddr = builder->emitFieldAddress(
+                                uintPtrType,
+                                anyValueVar,
+                                anyValInfo->fieldKeys[fieldOffset]);
+                            builder->emitStore(dstAddr, dstVal);
+                        }
+                        else
+                            SLANG_UNIMPLEMENTED_X(
+                                "Pointer sizes other than 32 or 64 haven't been implemented!");
                     }
                 }
                 break;
@@ -498,7 +555,7 @@ struct AnyValueMarshallingContext
 
     IRFunc* generatePackingFunc(IRType* type, IRAnyValueType* anyValueType)
     {
-        IRBuilder builder(sharedContext->module);
+        IRBuilder builder(module);
         builder.setInsertBefore(type);
         auto anyValInfo = ensureAnyValueType(anyValueType);
 
@@ -534,6 +591,7 @@ struct AnyValueMarshallingContext
         }
 
         TypePackingContext context;
+        context.targetRequest = targetProgram->getTargetReq();
         context.anyValInfo = anyValInfo;
         context.fieldOffset = context.intraFieldOffset = 0;
         context.uintPtrType = builder.getPtrType(builder.getUIntType());
@@ -699,33 +757,48 @@ struct AnyValueMarshallingContext
                 }
                 break;
             case kIROp_PtrType:
-#if SLANG_PTR_IS_64
             case kIROp_IntPtrType:
             case kIROp_UIntPtrType:
-#endif
-                ensureOffsetAt8ByteBoundary();
-                if (fieldOffset < static_cast<uint32_t>(anyValInfo->fieldKeys.getCount()))
                 {
-                    auto srcAddr = builder->emitFieldAddress(
-                        uintPtrType,
-                        anyValueVar,
-                        anyValInfo->fieldKeys[fieldOffset]);
-                    auto lowBits = builder->emitLoad(srcAddr);
-                    fieldOffset++;
+                    auto ptrSize = getPointerSize(targetRequest);
+                    ensureOffsetAtNByteBoundary(int(ptrSize));
                     if (fieldOffset < static_cast<uint32_t>(anyValInfo->fieldKeys.getCount()))
                     {
-                        auto srcAddr1 = builder->emitFieldAddress(
+                        auto srcAddr = builder->emitFieldAddress(
                             uintPtrType,
                             anyValueVar,
                             anyValInfo->fieldKeys[fieldOffset]);
-                        fieldOffset++;
-                        auto highBits = builder->emitLoad(srcAddr1);
-                        // Use uint2 instead of uint64 to avoid Int64 capability requirement
-                        auto uint2Type = builder->getVectorType(builder->getUIntType(), 2);
-                        IRInst* components[2] = {lowBits, highBits};
-                        auto uint2Val = builder->emitMakeVector(uint2Type, 2, components);
-                        auto combinedBits = builder->emitBitCast(dataType, uint2Val);
-                        builder->emitStore(concreteVar, combinedBits);
+                        if (ptrSize == 8)
+                        {
+                            auto lowBits = builder->emitLoad(srcAddr);
+                            fieldOffset++;
+                            if (fieldOffset <
+                                static_cast<uint32_t>(anyValInfo->fieldKeys.getCount()))
+                            {
+                                auto srcAddr1 = builder->emitFieldAddress(
+                                    uintPtrType,
+                                    anyValueVar,
+                                    anyValInfo->fieldKeys[fieldOffset]);
+                                fieldOffset++;
+                                auto highBits = builder->emitLoad(srcAddr1);
+                                // Use uint2 instead of uint64 to avoid Int64 capability requirement
+                                auto uint2Type = builder->getVectorType(builder->getUIntType(), 2);
+                                IRInst* components[2] = {lowBits, highBits};
+                                auto uint2Val = builder->emitMakeVector(uint2Type, 2, components);
+                                auto combinedBits = builder->emitBitCast(dataType, uint2Val);
+                                builder->emitStore(concreteVar, combinedBits);
+                            }
+                        }
+                        else if (ptrSize == 4)
+                        {
+                            auto srcVal = builder->emitLoad(srcAddr);
+                            srcVal = builder->emitBitCast(dataType, srcVal);
+                            builder->emitStore(concreteVar, srcVal);
+                            advanceOffset(4);
+                        }
+                        else
+                            SLANG_UNIMPLEMENTED_X(
+                                "Pointer sizes other than 32 or 64 haven't been implemented!");
                     }
                 }
                 break;
@@ -767,7 +840,7 @@ struct AnyValueMarshallingContext
 
     IRFunc* generateUnpackingFunc(IRType* type, IRAnyValueType* anyValueType)
     {
-        IRBuilder builder(sharedContext->module);
+        IRBuilder builder(module);
         builder.setInsertBefore(type);
         auto anyValInfo = ensureAnyValueType(anyValueType);
 
@@ -789,6 +862,7 @@ struct AnyValueMarshallingContext
         auto resultVar = builder.emitVar(type);
 
         TypeUnpackingContext context;
+        context.targetRequest = targetProgram->getTargetReq();
         context.anyValInfo = anyValInfo;
         context.fieldOffset = context.intraFieldOffset = 0;
         context.uintPtrType = builder.getPtrType(builder.getUIntType());
@@ -822,7 +896,7 @@ struct AnyValueMarshallingContext
         auto func = ensureMarshallingFunc(
             operand->getDataType(),
             cast<IRAnyValueType>(packInst->getDataType()));
-        IRBuilder builderStorage(sharedContext->module);
+        IRBuilder builderStorage(module);
         auto builder = &builderStorage;
         builder->setInsertBefore(packInst);
         auto callInst = builder->emitCallInst(packInst->getDataType(), func.packFunc, 1, &operand);
@@ -836,7 +910,7 @@ struct AnyValueMarshallingContext
         auto func = ensureMarshallingFunc(
             unpackInst->getDataType(),
             cast<IRAnyValueType>(operand->getDataType()));
-        IRBuilder builderStorage(sharedContext->module);
+        IRBuilder builderStorage(module);
         auto builder = &builderStorage;
         builder->setInsertBefore(unpackInst);
         auto callInst =
@@ -869,37 +943,35 @@ struct AnyValueMarshallingContext
         // since we will re-use that state for any code we
         // generate along the way.
         //
-        sharedContext->addToWorkList(sharedContext->module->getModuleInst());
+        addToWorkList(module->getModuleInst());
 
-        while (sharedContext->workList.getCount() != 0)
+        while (workList.getCount() != 0)
         {
-            IRInst* inst = sharedContext->workList.getLast();
+            IRInst* inst = workList.getLast();
 
-            sharedContext->workList.removeLast();
-            sharedContext->workListSet.remove(inst);
+            workList.removeLast();
+            workListSet.remove(inst);
 
             processInst(inst);
 
             for (auto child = inst->getLastChild(); child; child = child->getPrevInst())
             {
-                sharedContext->addToWorkList(child);
+                addToWorkList(child);
             }
         }
 
         // Finally, replace all `AnyValueType` with the actual struct type that implements it.
-        for (auto inst : sharedContext->module->getModuleInst()->getChildren())
+        for (auto inst : module->getModuleInst()->getChildren())
         {
             if (auto anyValueType = as<IRAnyValueType>(inst))
                 processAnyValueType(anyValueType);
         }
-        sharedContext->mapInterfaceRequirementKeyValue.clear();
     }
 };
 
-void generateAnyValueMarshallingFunctions(SharedGenericsLoweringContext* sharedContext)
+void generateAnyValueMarshallingFunctions(IRModule* module, TargetProgram* targetProgram)
 {
-    AnyValueMarshallingContext context;
-    context.sharedContext = sharedContext;
+    AnyValueMarshallingContext context(module, targetProgram);
     context.processModule();
 }
 
@@ -908,7 +980,7 @@ SlangInt alignUp(SlangInt x, SlangInt alignment)
     return (x + alignment - 1) / alignment * alignment;
 }
 
-SlangInt _getAnyValueSizeRaw(IRType* type, SlangInt offset)
+SlangInt _getAnyValueSizeRaw(IRType* type, SlangInt offset, TargetProgram* program)
 {
     switch (type->getOp())
     {
@@ -916,20 +988,18 @@ SlangInt _getAnyValueSizeRaw(IRType* type, SlangInt offset)
     case kIROp_FloatType:
     case kIROp_UIntType:
     case kIROp_BoolType:
-#if SLANG_PTR_IS_32
-    case kIROp_IntPtrType:
-    case kIROp_UIntPtrType:
-#endif
         return alignUp(offset, 4) + 4;
     case kIROp_UInt64Type:
     case kIROp_Int64Type:
     case kIROp_DoubleType:
+        return alignUp(offset, 8) + 8;
     case kIROp_PtrType:
-#if SLANG_PTR_IS_64
     case kIROp_IntPtrType:
     case kIROp_UIntPtrType:
-#endif
-        return alignUp(offset, 8) + 8;
+        {
+            auto ptrSize = getPointerSize(program->getTargetReq());
+            return alignUp(offset, ptrSize) + ptrSize;
+        }
     case kIROp_Int16Type:
     case kIROp_UInt16Type:
     case kIROp_HalfType:
@@ -941,7 +1011,7 @@ SlangInt _getAnyValueSizeRaw(IRType* type, SlangInt offset)
         {
             auto enumType = static_cast<IREnumType*>(type);
             auto tagType = enumType->getTagType();
-            return _getAnyValueSizeRaw(tagType, offset);
+            return _getAnyValueSizeRaw(tagType, offset, program);
         }
     case kIROp_VectorType:
         {
@@ -950,7 +1020,7 @@ SlangInt _getAnyValueSizeRaw(IRType* type, SlangInt offset)
             auto elementCount = getIntVal(vectorType->getElementCount());
             for (IRIntegerValue i = 0; i < elementCount; i++)
             {
-                offset = _getAnyValueSizeRaw(elementType, offset);
+                offset = _getAnyValueSizeRaw(elementType, offset, program);
                 if (offset < 0)
                     return offset;
             }
@@ -966,7 +1036,7 @@ SlangInt _getAnyValueSizeRaw(IRType* type, SlangInt offset)
             {
                 for (IRIntegerValue j = 0; j < colCount; j++)
                 {
-                    offset = _getAnyValueSizeRaw(elementType, offset);
+                    offset = _getAnyValueSizeRaw(elementType, offset, program);
                     if (offset < 0)
                         return offset;
                 }
@@ -978,7 +1048,7 @@ SlangInt _getAnyValueSizeRaw(IRType* type, SlangInt offset)
             auto structType = cast<IRStructType>(type);
             for (auto field : structType->getFields())
             {
-                offset = _getAnyValueSizeRaw(field->getFieldType(), offset);
+                offset = _getAnyValueSizeRaw(field->getFieldType(), offset, program);
                 if (offset < 0)
                     return offset;
             }
@@ -989,7 +1059,7 @@ SlangInt _getAnyValueSizeRaw(IRType* type, SlangInt offset)
             auto arrayType = cast<IRArrayType>(type);
             for (IRIntegerValue i = 0; i < getIntVal(arrayType->getElementCount()); i++)
             {
-                offset = _getAnyValueSizeRaw(arrayType->getElementType(), offset);
+                offset = _getAnyValueSizeRaw(arrayType->getElementType(), offset, program);
                 if (offset < 0)
                     return offset;
             }
@@ -1006,7 +1076,7 @@ SlangInt _getAnyValueSizeRaw(IRType* type, SlangInt offset)
             for (UInt i = 0; i < tupleType->getOperandCount(); i++)
             {
                 auto elementType = tupleType->getOperand(i);
-                offset = _getAnyValueSizeRaw((IRType*)elementType, offset);
+                offset = _getAnyValueSizeRaw((IRType*)elementType, offset, program);
                 if (offset < 0)
                     return offset;
             }
@@ -1018,12 +1088,14 @@ SlangInt _getAnyValueSizeRaw(IRType* type, SlangInt offset)
         {
             return alignUp(offset, 4) + kRTTIHandleSize;
         }
+    case kIROp_SetTagType:
+        {
+            return alignUp(offset, 4) + 4;
+        }
     case kIROp_InterfaceType:
         {
             auto interfaceType = cast<IRInterfaceType>(type);
-            auto size = SharedGenericsLoweringContext::getInterfaceAnyValueSize(
-                interfaceType,
-                interfaceType->sourceLoc);
+            auto size = getInterfaceAnyValueSize(interfaceType, interfaceType->sourceLoc);
             size += kRTTIHeaderSize;
             return alignUp(offset, 4) + alignUp((SlangInt)size, 4);
         }
@@ -1034,25 +1106,21 @@ SlangInt _getAnyValueSizeRaw(IRType* type, SlangInt offset)
             for (UInt i = 0; i < associatedType->getOperandCount(); i++)
                 maxSize = Math::Max(
                     maxSize,
-                    _getAnyValueSizeRaw((IRType*)associatedType->getOperand(i), offset));
+                    _getAnyValueSizeRaw((IRType*)associatedType->getOperand(i), offset, program));
             return maxSize;
         }
     case kIROp_ThisType:
         {
             auto thisType = cast<IRThisType>(type);
             auto interfaceType = thisType->getConstraintType();
-            auto size = SharedGenericsLoweringContext::getInterfaceAnyValueSize(
-                interfaceType,
-                interfaceType->sourceLoc);
+            auto size = getInterfaceAnyValueSize(interfaceType, interfaceType->sourceLoc);
             return alignUp(offset, 4) + alignUp((SlangInt)size, 4);
         }
     case kIROp_ExtractExistentialType:
         {
             auto existentialValue = type->getOperand(0);
             auto interfaceType = cast<IRInterfaceType>(existentialValue->getDataType());
-            auto size = SharedGenericsLoweringContext::getInterfaceAnyValueSize(
-                interfaceType,
-                interfaceType->sourceLoc);
+            auto size = getInterfaceAnyValueSize(interfaceType, interfaceType->sourceLoc);
             return alignUp(offset, 4) + alignUp((SlangInt)size, 4);
         }
     case kIROp_LookupWitnessMethod:
@@ -1087,9 +1155,7 @@ SlangInt _getAnyValueSizeRaw(IRType* type, SlangInt offset)
             {
                 anyValueSize = Math::Min(
                     anyValueSize,
-                    SharedGenericsLoweringContext::getInterfaceAnyValueSize(
-                        assocType->getOperand(i),
-                        type->sourceLoc));
+                    getInterfaceAnyValueSize(assocType->getOperand(i), type->sourceLoc));
             }
 
             if (anyValueSize == kInvalidAnyValueSize)
@@ -1097,6 +1163,11 @@ SlangInt _getAnyValueSizeRaw(IRType* type, SlangInt offset)
 
             return alignUp(offset, 4) + alignUp((SlangInt)anyValueSize, 4);
         }
+
+        // treat CoopVec as an opaque handle type
+    case kIROp_CoopVectorType:
+        return alignUp(offset, 4) + 8;
+
     default:
         if (isResourceType(type))
         {
@@ -1106,9 +1177,9 @@ SlangInt _getAnyValueSizeRaw(IRType* type, SlangInt offset)
     }
 }
 
-SlangInt getAnyValueSize(IRType* type)
+SlangInt getAnyValueSize(IRType* type, TargetProgram* program)
 {
-    auto rawSize = _getAnyValueSizeRaw(type, 0);
+    auto rawSize = _getAnyValueSizeRaw(type, 0, program);
     if (rawSize < 0)
         return rawSize;
     return alignUp(rawSize, 4);

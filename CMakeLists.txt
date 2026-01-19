@@ -20,7 +20,7 @@ set(PROJECT_VERSION "${SLANG_VERSION_FULL}")
 # Global CMake options
 #
 if(${CMAKE_VERSION} VERSION_GREATER_EQUAL "3.24")
-    cmake_policy(SET CMP0135 OLD)
+    cmake_policy(SET CMP0135 NEW)
 endif()
 cmake_policy(SET CMP0077 NEW)
 set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
@@ -128,6 +128,7 @@ option(SLANG_ENABLE_DXIL "Enable generating DXIL with DXC" ON)
 option(SLANG_ENABLE_FULL_IR_VALIDATION "Enable full IR validation (SLOW!)")
 option(SLANG_ENABLE_IR_BREAK_ALLOC "Enable _debugUID on IR allocation")
 option(SLANG_ENABLE_ASAN "Enable ASAN (address sanitizer)")
+option(SLANG_ENABLE_COVERAGE "Enable code coverage instrumentation")
 
 option(SLANG_ENABLE_PREBUILT_BINARIES "Enable using prebuilt binaries" ON)
 option(SLANG_ENABLE_GFX "Enable gfx targets" ON)
@@ -292,12 +293,12 @@ enum_option(
     SLANG_LIB_TYPE
     # Default
     SHARED
-    "How to build the slang lib:"
+    "How to build the slang-compiler lib:"
     # Options
     SHARED
-    "Build slang as a shared library (default)"
+    "Build slang-compiler as a shared library (default)"
     STATIC
-    "Build slang as a static library"
+    "Build slang-compiler as a static library"
 )
 
 option(
@@ -501,6 +502,7 @@ add_subdirectory(source/slang-core-module)
 add_subdirectory(source/slang-glsl-module)
 add_subdirectory(source/slang)
 add_subdirectory(source/slangc)
+add_subdirectory(source/standard-modules)
 add_subdirectory(examples)
 
 #
