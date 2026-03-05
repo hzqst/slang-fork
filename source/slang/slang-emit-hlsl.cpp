@@ -5,6 +5,7 @@
 #include "slang-emit-source-writer.h"
 #include "slang-ir-util.h"
 #include "slang-mangled-lexer.h"
+#include "slang-rich-diagnostics.h"
 
 #include <assert.h>
 
@@ -596,10 +597,9 @@ bool HLSLSourceEmitter::tryEmitInstStmtImpl(IRInst* inst)
 {
     auto diagnoseFloatAtommic = [&]()
     {
-        getSink()->diagnose(
-            inst,
-            Diagnostics::unsupportedTargetIntrinsic,
-            "floating point atomic operation");
+        getSink()->diagnose(Diagnostics::UnsupportedTargetIntrinsic{
+            .operation = "floating point atomic operation",
+            .location = inst->sourceLoc});
     };
     switch (inst->getOp())
     {
@@ -1469,7 +1469,29 @@ void HLSLSourceEmitter::emitSimpleTypeImpl(IRType* type)
         }
     case kIROp_HitObjectType:
         {
-            m_writer->emit("NvHitObject");
+            // Emit appropriate HitObject type based on capability
+            // User must explicitly specify which SER path to use
+            auto targetCaps = getTargetReq()->getTargetCaps();
+            auto nvapiCapabilitySet = CapabilitySet(CapabilityName::hlsl_nvapi);
+            auto sm69CapabilitySet = CapabilitySet(CapabilityName::_sm_6_9);
+
+            if (targetCaps.implies(sm69CapabilitySet))
+            {
+                // DXR 1.3 native: use dx::HitObject namespace
+                m_writer->emit("dx::HitObject");
+            }
+            else if (targetCaps.implies(nvapiCapabilitySet))
+            {
+                // NVAPI extension: use NvHitObject
+                m_writer->emit("NvHitObject");
+                // Ensure NVAPI header is included when using NvHitObject type
+                m_extensionTracker->m_requiresNVAPI = true;
+            }
+            else
+            {
+                SLANG_UNEXPECTED("HitObjectType requires either SM 6.9+ (DXR 1.3 native) or "
+                                 "hlsl_nvapi capability");
+            }
             return;
         }
     case kIROp_TextureFootprintType:
@@ -1664,11 +1686,10 @@ void HLSLSourceEmitter::emitSemanticsImpl(IRInst* inst, bool allowOffsets)
         auto semanticName = semanticDecoration->getSemanticName();
         m_writer->emit(semanticName);
 
-        // Only emit semantic index for semantics that accept them
-        if (doesHLSLSemanticAcceptIndex(semanticName))
-        {
-            m_writer->emit(semanticDecoration->getSemanticIndex());
-        }
+        auto semanticIndex = semanticDecoration->getSemanticIndex();
+        // Only emit semantic index for semantics that specify an index and accept an index
+        if (semanticIndex >= 0 && doesHLSLSemanticAcceptIndex(semanticName))
+            m_writer->emit(semanticIndex);
         return;
     }
     else if (auto packOffsetDecoration = inst->findDecoration<IRPackOffsetDecoration>())

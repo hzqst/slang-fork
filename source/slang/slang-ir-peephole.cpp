@@ -5,6 +5,7 @@
 #include "slang-ir-layout.h"
 #include "slang-ir-sccp.h"
 #include "slang-ir-util.h"
+#include "slang-target-program.h"
 
 namespace Slang
 {
@@ -275,6 +276,48 @@ struct PeepholeContext : InstPassBase
                     baseType = t;
                 else
                     baseType = inst->getOperand(0)->getDataType();
+
+                // Special handling for DescriptorHandleType - its size/alignment is
+                // target-dependent
+                if (as<IRDescriptorHandleType>(baseType))
+                {
+                    bool useUint64 = targetProgram->getTargetReq()->getTargetCaps().implies(
+                        CapabilityAtom::spvBindlessTextureNV);
+
+                    IRBuilder builder(module);
+                    IRBuilderSourceLocRAII srcLocRAII(&builder, inst->sourceLoc);
+                    builder.setInsertBefore(inst);
+
+                    // Get the underlying type based on capability:
+                    // - With spvBindlessTextureNV: uint64_t
+                    // - Without: uint2
+                    IRType* underlyingType;
+                    if (useUint64)
+                    {
+                        underlyingType = builder.getUInt64Type();
+                    }
+                    else
+                    {
+                        auto uintType = builder.getUIntType();
+                        underlyingType = builder.getVectorType(uintType, 2);
+                    }
+
+                    IRSizeAndAlignment sizeAlign;
+                    if (SLANG_FAILED(getNaturalSizeAndAlignment(
+                            targetProgram->getTargetReq(),
+                            underlyingType,
+                            &sizeAlign)))
+                        break;
+
+                    IRIntegerValue value =
+                        (inst->getOp() == kIROp_AlignOf) ? sizeAlign.alignment : sizeAlign.size;
+
+                    auto resultVal = builder.getIntValue(inst->getDataType(), value);
+                    inst->replaceUsesWith(resultVal);
+                    maybeRemoveOldInst(inst);
+                    changed = true;
+                    break;
+                }
 
                 if (SLANG_FAILED(getNaturalSizeAndAlignment(
                         targetProgram->getTargetReq(),
@@ -1333,6 +1376,41 @@ struct PeepholeContext : InstPassBase
                 }
                 break;
             }
+        case kIROp_IsCoopFloat:
+            {
+                auto type = inst->getOperand(0)->getDataType();
+                if (auto vectorType = as<IRVectorType>(type))
+                    type = vectorType->getElementType();
+                if (auto matType = as<IRMatrixType>(type))
+                    type = matType->getElementType();
+                if (isConcreteType(type))
+                {
+                    bool result = false;
+                    if (isFloatingType(type))
+                    {
+                        result = true;
+                    }
+                    else
+                    {
+                        switch (type->getOp())
+                        {
+                        case kIROp_FloatE5M2Type:
+                        case kIROp_FloatE4M3Type:
+                        case kIROp_BFloat16Type:
+                            result = true;
+                            break;
+                        }
+                    }
+                    IRBuilder builder(module);
+                    IRBuilderSourceLocRAII srcLocRAII(&builder, inst->sourceLoc);
+                    builder.setInsertBefore(inst);
+
+                    inst->replaceUsesWith(builder.getBoolValue(result));
+                    maybeRemoveOldInst(inst);
+                    changed = true;
+                }
+                break;
+            }
         case kIROp_Load:
             {
                 // An attempt to load from an undefined pointer value
@@ -1438,8 +1516,7 @@ bool peepholeOptimize(TargetProgram* target, IRModule* module, PeepholeOptimizat
     context.targetProgram = target;
     context.isPrelinking = options.isPrelinking;
     context.useFastAnalysis =
-        target ? target->getOptionSet().getBoolOption(CompilerOptionName::MinimumSlangOptimization)
-               : true;
+        target ? target->getOptionSet().shouldPerformMinimumOptimizations() : true;
     return context.processModule();
 }
 
@@ -1448,8 +1525,7 @@ bool peepholeOptimize(TargetProgram* target, IRInst* func)
     PeepholeContext context = PeepholeContext(func->getModule());
     context.targetProgram = target;
     context.useFastAnalysis =
-        target ? target->getOptionSet().getBoolOption(CompilerOptionName::MinimumSlangOptimization)
-               : true;
+        target ? target->getOptionSet().shouldPerformMinimumOptimizations() : true;
     return context.processFunc(func);
 }
 
